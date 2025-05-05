@@ -50,12 +50,6 @@ $dnsProviders = @(
     @{ Name = "Google DNS Secondary"; IP = "8.8.4.4"; Category = "Global" },
     @{ Name = "Cloudflare DNS"; IP = "1.1.1.1"; Category = "Global" },
     @{ Name = "Cloudflare DNS Secondary"; IP = "1.0.0.1"; Category = "Global" },
-    @{ Name = "Control D Standard"; IP = "76.76.2.0"; Category = "Global" },
-    @{ Name = "Control D Standard Secondary"; IP = "76.76.10.0"; Category = "Global" },
-    @{ Name = "Control D Uncensored"; IP = "76.76.2.1"; Category = "Global" },
-    @{ Name = "Control D Uncensored Secondary"; IP = "76.76.10.1"; Category = "Global" },
-    @{ Name = "Control D Family"; IP = "76.76.2.3"; Category = "Global" },
-    @{ Name = "Control D Family Secondary"; IP = "76.76.10.3"; Category = "Global" },
     @{ Name = "OpenDNS"; IP = "208.67.222.222"; Category = "Global" },
     @{ Name = "OpenDNS Secondary"; IP = "208.67.220.220"; Category = "Global" },
     @{ Name = "Quad9"; IP = "9.9.9.9"; Category = "Global" },
@@ -71,7 +65,14 @@ $dnsProviders = @(
     @{ Name = "CleanBrowsing Safe-1"; IP = "185.228.168.9"; Category = "Global" },
     @{ Name = "CleanBrowsing Safe-2"; IP = "185.228.169.9"; Category = "Global" },
     @{ Name = "Quad9 Privacy-1"; IP = "9.9.9.11"; Category = "Global" },
-    @{ Name = "Quad9 Privacy-2"; IP = "149.112.112.11"; Category = "Global" }
+    @{ Name = "Quad9 Privacy-2"; IP = "149.112.112.11"; Category = "Global" },
+    # Control D DNS Providers (moved to their own category)
+    @{ Name = "Control D Standard"; IP = "76.76.2.0"; Category = "ControlD" },
+    @{ Name = "Control D Standard Secondary"; IP = "76.76.10.0"; Category = "ControlD" },
+    @{ Name = "Control D Uncensored"; IP = "76.76.2.1"; Category = "ControlD" },
+    @{ Name = "Control D Uncensored Secondary"; IP = "76.76.10.1"; Category = "ControlD" },
+    @{ Name = "Control D Family"; IP = "76.76.2.3"; Category = "ControlD" },
+    @{ Name = "Control D Family Secondary"; IP = "76.76.10.3"; Category = "ControlD" }
 )
 
 # Define domains and record types to resolve
@@ -680,12 +681,10 @@ foreach ($recordType in $recordTypes) {
     # Get statistics for each category
     $egyptianStats = $categoryStats["Egyptian_${recordType}"]
     $globalStats = $categoryStats["Global_${recordType}"]
-    $controlDStats = $categoryStats["ControlD_${recordType}"]
     
     # Get best pairs for each category
     $bestEgyptianPair = $bestPairs["Egyptian_${recordType}"]
     $bestGlobalPair = $bestPairs["Global_${recordType}"]
-    $bestControlDPair = $bestPairs["ControlD_${recordType}"]
 
     # Display Egyptian results
     Write-ColoredMessage "`nBest Egyptian DNS Configuration:" -Color Yellow
@@ -723,30 +722,11 @@ foreach ($recordType in $recordTypes) {
         Write-ColoredMessage "No valid Global DNS pair found for $recordType records." -Color Red
     }
 
-    # Display Control D results
-    Write-ColoredMessage "`nBest Control D DNS Configuration:" -Color Yellow
-    if ($bestControlDPair -and $bestControlDPair.Primary -and $bestControlDPair.Secondary) {
-        Write-ColoredMessage "Primary:   $($bestControlDPair.Primary.IP) ($($bestControlDPair.Primary.Provider)) - $($bestControlDPair.Primary.ResponseTime) (Jitter: $($bestControlDPair.Primary.Jitter))" -Color Green
-        Write-ColoredMessage "Secondary: $($bestControlDPair.Secondary.IP) ($($bestControlDPair.Secondary.Provider)) - $($bestControlDPair.Secondary.ResponseTime) (Jitter: $($bestControlDPair.Secondary.Jitter))" -Color Green
-        
-        if ($controlDStats) {
-            Write-ColoredMessage "Statistics:" -Color Gray
-            Write-ColoredMessage "  Min: $([math]::Round($controlDStats.Min, 2)) ms" -Color Gray
-            Write-ColoredMessage "  Max: $([math]::Round($controlDStats.Max, 2)) ms" -Color Gray
-            Write-ColoredMessage "  Avg: $([math]::Round($controlDStats.Avg, 2)) ms" -Color Gray
-            Write-ColoredMessage "  Avg Jitter: $([math]::Round($controlDStats.AvgJitter, 2)) ms" -Color Gray
-            Write-ColoredMessage "  Successful Tests: $($controlDStats.Count)" -Color Gray
-        }
-    } else {
-        Write-ColoredMessage "No valid Control D DNS pair found for $recordType records." -Color Red
-    }
-
     # Overall recommendation
     Write-ColoredMessage "`nRecommendation for $recordType records:" -Color Cyan
     $validStats = @()
     if ($egyptianStats) { $validStats += @{Name = "Egyptian"; Avg = $egyptianStats.Avg; Jitter = $egyptianStats.AvgJitter; Pair = $bestEgyptianPair} }
     if ($globalStats) { $validStats += @{Name = "Global"; Avg = $globalStats.Avg; Jitter = $globalStats.AvgJitter; Pair = $bestGlobalPair} }
-    if ($controlDStats) { $validStats += @{Name = "Control D"; Avg = $controlDStats.Avg; Jitter = $controlDStats.AvgJitter; Pair = $bestControlDPair} }
     
     if ($validStats.Count -gt 0) {
         # Sort categories by average response time (lower is better)
@@ -790,12 +770,10 @@ $primaryRecordType = "A"
 # Get DNS stats for each category with this record type
 $egyptianStatsForOverall = $categoryStats["Egyptian_${primaryRecordType}"]
 $globalStatsForOverall = $categoryStats["Global_${primaryRecordType}"]
-$controlDStatsForOverall = $categoryStats["ControlD_${primaryRecordType}"]
 
 # Get best pairs for this record type
 $bestEgyptianPairForOverall = $bestPairs["Egyptian_${primaryRecordType}"]
 $bestGlobalPairForOverall = $bestPairs["Global_${primaryRecordType}"]
-$bestControlDPairForOverall = $bestPairs["ControlD_${primaryRecordType}"]
 
 # Get best overall DNS pair
 $validStats = @()
@@ -813,14 +791,6 @@ if ($globalStatsForOverall) {
         Avg = $globalStatsForOverall.Avg
         Jitter = $globalStatsForOverall.AvgJitter
         Pair = $bestGlobalPairForOverall
-    }
-}
-if ($controlDStatsForOverall) { 
-    $validStats += @{
-        Name = "Control D"
-        Avg = $controlDStatsForOverall.Avg
-        Jitter = $controlDStatsForOverall.AvgJitter
-        Pair = $bestControlDPairForOverall
     }
 }
 
