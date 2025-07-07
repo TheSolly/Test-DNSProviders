@@ -47,8 +47,11 @@ param(
     [Parameter(HelpMessage="Show detailed timing information for each test")]
     [switch]$DetailedOutput,
     
-    [Parameter(HelpMessage="Test using alternative domains (google.com, facebook.com, etc.)")]
+    [Parameter(HelpMessage="Test using alternative domains (google.com, reddit.com, etc.)")]
     [switch]$AlternateDomains,
+    
+    [Parameter(HelpMessage="Test multiple domains instead of just one random domain")]
+    [switch]$MultiDomainTest,
     
     [Parameter(HelpMessage="Generate network configuration scripts for Windows, Linux, and macOS")]
     [switch]$GenerateScripts,
@@ -298,11 +301,62 @@ $dnsProviders = @(    # ========== EGYPTIAN DNS PROVIDERS ==========
 )
 
 # Define domains and record types to resolve
-$testDomain = $Domain
+$testDomains = @($Domain)  # Default to the specified domain
+
 if ($AlternateDomains) {
-    $testDomains = @("google.com", "facebook.com", "youtube.com", "amazon.com", "microsoft.com")
-    $testDomain = $testDomains | Get-Random
-    Write-ColoredMessage "Using alternate domain: $testDomain" -Color Yellow
+    $alternateDomainList = @(
+        "google.com",
+        "facebook.com", 
+        "youtube.com",
+        "amazon.com",
+        "microsoft.com",
+        "reddit.com",
+        "twitter.com",
+        "instagram.com",
+        "linkedin.com",
+        "github.com",
+        "stackoverflow.com",
+        "wikipedia.org",
+        "netflix.com",
+        "apple.com",
+        "cloudflare.com",
+        "discord.com",
+        "twitch.tv",
+        "zoom.us",
+        "dropbox.com",
+        "spotify.com",
+        "whatsapp.com",
+        "telegram.org",
+        "office.com",
+        "live.com",
+        "outlook.com",
+        "yahoo.com",
+        "bing.com",
+        "duckduckgo.com",
+        "baidu.com",
+        "cnn.com",
+        "bbc.com",
+        "reuters.com",
+        "theguardian.com",
+        "nytimes.com",
+        "wordpress.com",
+        "medium.com",
+        "imgur.com",
+        "tiktok.com",
+        "pinterest.com",
+        "tumblr.com",
+        "quora.com"
+    )
+    
+    if ($MultiDomainTest) {
+        # Test multiple domains (select 5 random domains for comprehensive testing)
+        $testDomains = $alternateDomainList | Get-Random -Count 5
+        Write-ColoredMessage "Testing multiple domains: $($testDomains -join ', ')" -Color Yellow
+    } else {
+        # Test single random domain
+        $testDomains = @($alternateDomainList | Get-Random)
+        Write-ColoredMessage "Using alternate domain: $($testDomains[0])" -Color Yellow
+    }
 }
 
 $recordTypes = @("A")
@@ -383,7 +437,7 @@ function Test-DNS {
             Remove-Job $resolveJob -Force
             Write-ColoredMessage "Failed (timeout)" -Color Red
             Update-DnsTracker -DnsIP $dnsIP -ProviderName $providerName -Success $false
-            return @{Status = "Error"; ResponseTime = 0; Jitter = 0; RecordType = $recordType}
+            return @{Status = "Error"; ResponseTime = 0; Jitter = 0; RecordType = $recordType; Domain = $domain}
         }
         
         $result = Receive-Job $resolveJob
@@ -392,12 +446,12 @@ function Test-DNS {
         if (-not $result.Success) {
             Write-ColoredMessage "Failed ($($result.Error))" -Color Red
             Update-DnsTracker -DnsIP $dnsIP -ProviderName $providerName -Success $false
-            return @{Status = "Error"; ResponseTime = 0; Jitter = 0; RecordType = $recordType}
+            return @{Status = "Error"; ResponseTime = 0; Jitter = 0; RecordType = $recordType; Domain = $domain}
         }
     } catch {
         Write-ColoredMessage "Failed (error: $_)" -Color Red
         Update-DnsTracker -DnsIP $dnsIP -ProviderName $providerName -Success $false
-        return @{Status = "Error"; ResponseTime = 0; Jitter = 0; RecordType = $recordType}
+        return @{Status = "Error"; ResponseTime = 0; Jitter = 0; RecordType = $recordType; Domain = $domain}
     }
 
     Write-ColoredMessage "Passed" -Color Green
@@ -410,7 +464,7 @@ function Test-DNS {
                     Activity = "Testing DNS Server"
                     Status = "Performance Test $i of $TestCount"
                     PercentComplete = ($i / $TestCount) * 100
-                    CurrentOperation = "IP: $dnsIP ($recordType) - Timeout: ${currentTimeout}s"
+                    CurrentOperation = "IP: $dnsIP ($recordType) - Timeout: ${currentTimeout}s - Domain: $domain"
                 }
                 Write-Progress @progressParams
             }
@@ -445,7 +499,7 @@ function Test-DNS {
             # Continue testing even if one test fails
             Update-DnsTracker -DnsIP $dnsIP -ProviderName $providerName -Success $false
             if ($DetailedOutput) {
-                Write-Host "Error in test $i for $dnsIP ($recordType): $_" -ForegroundColor Yellow
+                Write-Host "Error in test $i for $dnsIP ($recordType) on $domain : $_" -ForegroundColor Yellow
             }
             continue
         }
@@ -456,7 +510,7 @@ function Test-DNS {
     }
     
     if ($successCount -eq 0) {
-        return @{Status = "Error"; ResponseTime = 0; Jitter = 0; RecordType = $recordType}
+        return @{Status = "Error"; ResponseTime = 0; Jitter = 0; RecordType = $recordType; Domain = $domain}
     }
     
     # Calculate metrics
@@ -475,6 +529,7 @@ function Test-DNS {
         RecordType = $recordType
         SuccessRate = ($successCount / $TestCount) * 100
         ActualTimeout = $currentTimeout
+        Domain = $domain
     }
 }
 
@@ -483,11 +538,14 @@ Clear-Host
 Write-ColoredMessage "DNS Performance Test" -Color Cyan
 Write-ColoredMessage "===================" -Color Cyan
 Write-ColoredMessage "Testing DNS servers response time for: " -Color Yellow -NoNewline
-Write-ColoredMessage $testDomain -Color Green
+Write-ColoredMessage ($testDomains -join ', ') -Color Green
 Write-ColoredMessage "Mode: $(if ($Parallel) { 'Parallel' } else { 'Sequential' })" -Color Yellow
 Write-ColoredMessage "Testing $(if ($Category -eq 'All') { 'all' } else { $Category }) DNS providers" -Color Yellow
 Write-ColoredMessage "Record types: $($recordTypes -join ', ')" -Color Yellow
 Write-ColoredMessage "Tests per DNS: $TestCount with $Timeout second timeout" -Color Yellow
+if ($testDomains.Count -gt 1) {
+    Write-ColoredMessage "Multi-domain testing: Testing each DNS server against $($testDomains.Count) domains" -Color Yellow
+}
 if ($AdaptiveTimeout) {
     Write-ColoredMessage "Adaptive timeout enabled: Egyptian DNS timeout = $EgyptianTimeout seconds" -Color Yellow
 }
@@ -717,18 +775,26 @@ if (-not $Parallel) {
     foreach ($dns in $filteredDnsProviders) {
         Write-ColoredMessage "`nTesting $($dns.Name)..." -Color Yellow
         
-        foreach ($recordType in $recordTypes) {
-            $result = Test-DNS -dnsIP $dns.IP -domain $testDomain -recordType $recordType -category $dns.Category -providerName $dns.Name
+        # Test each domain
+        foreach ($testDomain in $testDomains) {
+            if ($testDomains.Count -gt 1) {
+                Write-ColoredMessage "  Domain: $testDomain" -Color Cyan
+            }
             
-            $results += [PSCustomObject]@{
-                Provider = $dns.Name
-                IP = $dns.IP
-                Category = $dns.Category
-                ResponseTime = if ($result.Status -eq "Error") { "Timeout" } else { "$($result.ResponseTime) ms" }
-                Status = $result.Status
-                Jitter = if ($result.Status -eq "Error") { "N/A" } else { "$($result.Jitter) ms" }
-                RecordType = $result.RecordType
-                SuccessRate = if ($result.Status -eq "Error") { 0 } else { $result.SuccessRate }
+            foreach ($recordType in $recordTypes) {
+                $result = Test-DNS -dnsIP $dns.IP -domain $testDomain -recordType $recordType -category $dns.Category -providerName $dns.Name
+                
+                $results += [PSCustomObject]@{
+                    Provider = $dns.Name
+                    IP = $dns.IP
+                    Category = $dns.Category
+                    Domain = $testDomain
+                    ResponseTime = if ($result.Status -eq "Error") { "Timeout" } else { "$($result.ResponseTime) ms" }
+                    Status = $result.Status
+                    Jitter = if ($result.Status -eq "Error") { "N/A" } else { "$($result.Jitter) ms" }
+                    RecordType = $result.RecordType
+                    SuccessRate = if ($result.Status -eq "Error") { 0 } else { $result.SuccessRate }
+                }
             }
         }
         
@@ -774,6 +840,10 @@ if ($recordTypes.Count -gt 1) {
                     Expression = { $_.IP }
                     Width = 20
                 }, @{
+                    Label = "Domain"
+                    Expression = { $_.Domain }
+                    Width = 20
+                }, @{
                     Label = "Response Time"
                     Expression = { $_.ResponseTime }
                     Width = 15
@@ -809,6 +879,10 @@ if ($recordTypes.Count -gt 1) {
         }, @{
             Label = "IP Address"
             Expression = { $_.IP }
+            Width = 20
+        }, @{
+            Label = "Domain"
+            Expression = { $_.Domain }
             Width = 20
         }, @{
             Label = "Response Time"
