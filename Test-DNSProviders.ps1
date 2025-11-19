@@ -23,8 +23,8 @@ param(
     [ValidateRange(0.0, 1.0)]
     [double]$MaxFailureRate = 0.8,
     
-    [Parameter(HelpMessage="Remove consistently failing DNS servers from results")]
-    [switch]$RemoveFailingDNS,
+    [Parameter(HelpMessage="Disable removal of consistently failing DNS servers from results")]
+    [switch]$DisableFailureRemoval,
     
     [Parameter(HelpMessage="Number of consecutive failures before flagging DNS as problematic (default: 3)")]
     [int]$FailureThreshold = 3,
@@ -55,14 +55,35 @@ param(
     
     [Parameter(HelpMessage="Generate network configuration scripts for Windows, Linux, and macOS")]
     [switch]$GenerateScripts,
-      [Parameter(HelpMessage="Show warnings for problematic DNS servers")]
-    [switch]$ShowWarnings,
+      [Parameter(HelpMessage="Hide warnings for problematic DNS servers")]
+    [switch]$HideWarnings,
     
     [Parameter(HelpMessage="Aggressive mode: Remove failing DNS servers immediately")]
     [switch]$AggressiveMode,
     
     [Parameter(HelpMessage="Quick test mode: Reduce test count for faster results")]
-    [switch]$QuickTest
+    [switch]$QuickTest,
+    
+    [Parameter(HelpMessage="Disable persistent failure tracking across script runs")]
+    [switch]$DisablePersistentTracking,
+    
+    [Parameter(HelpMessage="Number of script runs a DNS must fail before being blacklisted (default: 3)")]
+    [int]$PersistentFailureThreshold = 3,
+    
+    [Parameter(HelpMessage="Reset persistent failure tracking history")]
+    [switch]$ResetTracking,
+    
+    [Parameter(HelpMessage="Show persistent tracking statistics")]
+    [switch]$ShowTrackingStats,
+    
+    [Parameter(HelpMessage="Skip IPv6 support testing (AAAA records)")]
+    [switch]$SkipIPv6Test,
+    
+    [Parameter(HelpMessage="Skip DNSSEC validation support testing")]
+    [switch]$SkipDNSSECTest,
+    
+    [Parameter(HelpMessage="Skip DNS response completeness and quality verification")]
+    [switch]$SkipResponseVerification
 )
 
 # Check if required modules are available
@@ -72,10 +93,212 @@ if (-not (Get-Command "Resolve-DnsName" -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
+# Apply quick test mode settings
+# Apply quick test mode settings
+if ($QuickTest) {
+    $TestCount = [math]::Max(1, [math]::Floor($TestCount / 2))
+    $AggressiveMode = $true
+    $DisableFailureRemoval = $false
+    
+    # QuickTest optimizations:
+    # 1. Reduce timeout for faster failure detection (but not too short)
+    if ($Timeout -gt 2) {
+        $Timeout = 2
+    }
+    
+    # 2. Skip parallel mode overhead in quick tests (sequential is faster for quick tests)
+    $Parallel = $false
+    
+    # 3. Focus on previously successful DNS servers first (if history exists)
+    $script:QuickTestMode = $true
+}
+
 # Global variables for failure tracking
 $global:DnsFailureTracker = @{}
 $global:DnsSuccessTracker = @{}
 $global:RemovedDnsProviders = @()
+$global:PersistentTrackingFile = Join-Path $PSScriptRoot "dns-failure-history.json"
+
+# Persistent DNS Failure Tracking Functions
+# ==========================================
+
+function Initialize-PersistentTracking {
+    <#
+    .SYNOPSIS
+    Loads persistent DNS failure history from JSON file
+    #>
+    if ($DisablePersistentTracking) {
+        return @{}
+    }
+    
+    if (Test-Path $global:PersistentTrackingFile) {
+        try {
+            $content = Get-Content $global:PersistentTrackingFile -Raw | ConvertFrom-Json
+            $history = @{}
+            
+            # Convert from JSON object to hashtable
+            foreach ($property in $content.PSObject.Properties) {
+                $history[$property.Name] = @{
+                    FailureCount = $property.Value.FailureCount
+                    LastFailure = [DateTime]$property.Value.LastFailure
+                    TotalRuns = $property.Value.TotalRuns
+                    SuccessCount = $property.Value.SuccessCount
+                    Blacklisted = $property.Value.Blacklisted
+                }
+            }
+            
+            return $history
+        } catch {
+            Write-Warning "Failed to load persistent tracking data: $_"
+            return @{}
+        }
+    }
+    
+    return @{}
+}
+
+function Save-PersistentTracking {
+    <#
+    .SYNOPSIS
+    Saves DNS failure history to JSON file
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [hashtable]$History
+    )
+    
+    if ($DisablePersistentTracking) {
+        return
+    }
+    
+    try {
+        # Convert hashtable to JSON-friendly object
+        $jsonObject = @{}
+        foreach ($key in $History.Keys) {
+            $jsonObject[$key] = @{
+                FailureCount = $History[$key].FailureCount
+                LastFailure = $History[$key].LastFailure.ToString("o")
+                TotalRuns = $History[$key].TotalRuns
+                SuccessCount = $History[$key].SuccessCount
+                Blacklisted = $History[$key].Blacklisted
+            }
+        }
+        
+        $jsonObject | ConvertTo-Json -Depth 10 | Set-Content $global:PersistentTrackingFile -Force
+    } catch {
+        Write-Warning "Failed to save persistent tracking data: $_"
+    }
+}
+
+function Update-PersistentTracking {
+    <#
+    .SYNOPSIS
+    Updates persistent tracking for a DNS provider
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [hashtable]$History,
+        
+        [Parameter(Mandatory=$true)]
+        [string]$DnsIP,
+        
+        [Parameter(Mandatory=$true)]
+        [bool]$Failed
+    )
+    
+    if (-not $History.ContainsKey($DnsIP)) {
+        $History[$DnsIP] = @{
+            FailureCount = 0
+            LastFailure = [DateTime]::MinValue
+            TotalRuns = 0
+            SuccessCount = 0
+            Blacklisted = $false
+        }
+    }
+    
+    $History[$DnsIP].TotalRuns++
+    
+    if ($Failed) {
+        $History[$DnsIP].FailureCount++
+        $History[$DnsIP].LastFailure = Get-Date
+        
+        # Check if should be blacklisted
+        if ($History[$DnsIP].FailureCount -ge $PersistentFailureThreshold) {
+            $History[$DnsIP].Blacklisted = $true
+        }
+    } else {
+        $History[$DnsIP].SuccessCount++
+        # Reset failure count on success (but keep total runs)
+        if ($History[$DnsIP].SuccessCount -gt 0) {
+            $History[$DnsIP].FailureCount = 0
+            $History[$DnsIP].Blacklisted = $false
+        }
+    }
+}
+
+function Get-BlacklistedDNS {
+    <#
+    .SYNOPSIS
+    Returns list of blacklisted DNS IPs
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [hashtable]$History
+    )
+    
+    $blacklisted = @()
+    foreach ($dns in $History.Keys) {
+        if ($History[$dns].Blacklisted) {
+            $blacklisted += $dns
+        }
+    }
+    
+    return $blacklisted
+}
+
+function Show-TrackingStatistics {
+    <#
+    .SYNOPSIS
+    Displays persistent tracking statistics
+    #>
+    param(
+        [Parameter(Mandatory=$true)]
+        [hashtable]$History
+    )
+    
+    Write-ColoredMessage "`nPersistent DNS Tracking Statistics" -Color Cyan
+    Write-ColoredMessage "===================================" -Color Cyan
+    
+    if ($History.Keys.Count -eq 0) {
+        Write-ColoredMessage "No tracking history available yet." -Color Yellow
+        return
+    }
+    
+    $stats = $History.GetEnumerator() | ForEach-Object {
+        [PSCustomObject]@{
+            DNS = $_.Key
+            TotalRuns = $_.Value.TotalRuns
+            Failures = $_.Value.FailureCount
+            Successes = $_.Value.SuccessCount
+            FailureRate = if ($_.Value.TotalRuns -gt 0) { 
+                [math]::Round(($_.Value.FailureCount / $_.Value.TotalRuns) * 100, 1) 
+            } else { 0 }
+            Blacklisted = if ($_.Value.Blacklisted) { "YES" } else { "No" }
+            LastFailure = if ($_.Value.LastFailure -ne [DateTime]::MinValue) { 
+                $_.Value.LastFailure.ToString("yyyy-MM-dd HH:mm") 
+            } else { "Never" }
+        }
+    } | Sort-Object -Property Blacklisted, FailureRate -Descending
+    
+    $stats | Format-Table -AutoSize
+    
+    $blacklistedCount = ($stats | Where-Object { $_.Blacklisted -eq "YES" }).Count
+    if ($blacklistedCount -gt 0) {
+        Write-ColoredMessage "Total blacklisted DNS servers: $blacklistedCount" -Color Red
+    } else {
+        Write-ColoredMessage "No DNS servers are currently blacklisted." -Color Green
+    }
+}
 
 # Function to get adaptive timeout for DNS provider
 function Get-AdaptiveTimeout {
@@ -163,12 +386,43 @@ function Remove-FailingDnsProviders {
         [Array]$DnsProviders,
         [int]$FailureThreshold,
         [double]$MaxFailureRate,
-        [bool]$ShowWarnings
+        [bool]$HideWarnings,
+        [bool]$AggressiveMode = $false,
+        [bool]$DisablePersistentTracking = $false
     )
     
     $filteredProviders = @()
     
     foreach ($dns in $DnsProviders) {
+        # In aggressive mode, remove immediately on first failure
+        if ($AggressiveMode) {
+            $key = "$($dns.IP)|$($dns.Name)"
+            if ($global:DnsFailureTracker.ContainsKey($key) -and $global:DnsFailureTracker[$key] -gt 0 -and $global:DnsSuccessTracker[$key] -eq 0) {
+                $failures = $global:DnsFailureTracker[$key]
+                $successes = $global:DnsSuccessTracker[$key]
+                
+                # Update persistent tracking for this failure
+                if ($PersistentTracking) {
+                    Update-PersistentTracking -History $global:PersistentHistory -DnsIP $dns.IP -Failed $true
+                }
+                
+                $global:RemovedDnsProviders += [PSCustomObject]@{
+                    Name = $dns.Name
+                    IP = $dns.IP
+                    Category = $dns.Category
+                    Failures = $failures
+                    Successes = $successes
+                    FailureRate = "100%"
+                    Reason = "Aggressive mode - Failed initial test"
+                }
+                
+                if (-not $HideWarnings) {
+                    Write-ColoredMessage "  Removing $($dns.Name) ($($dns.IP)) - Failed initial test (Aggressive mode)" -Color Red
+                }
+                continue
+            }
+        }
+        
         $shouldRemove = Test-DnsRemoval -DnsIP $dns.IP -ProviderName $dns.Name -FailureThreshold $FailureThreshold -MaxFailureRate $MaxFailureRate
         
         if ($shouldRemove) {
@@ -177,6 +431,11 @@ function Remove-FailingDnsProviders {
             $successes = $global:DnsSuccessTracker[$key]
             $totalTests = $failures + $successes
             $failureRate = if ($totalTests -gt 0) { [math]::Round(($failures / $totalTests) * 100, 1) } else { 100 }
+            
+            # Update persistent tracking for this failure
+            if (-not $DisablePersistentTracking) {
+                Update-PersistentTracking -History $global:PersistentHistory -DnsIP $dns.IP -Failed $true
+            }
             
             $global:RemovedDnsProviders += [PSCustomObject]@{
                 Name = $dns.Name
@@ -188,7 +447,7 @@ function Remove-FailingDnsProviders {
                 Reason = if ($failures -ge $FailureThreshold -and $successes -eq 0) { "Consecutive failures" } else { "High failure rate" }
             }
             
-            if ($ShowWarnings) {
+            if (-not $HideWarnings) {
                 Write-ColoredMessage "  Removing $($dns.Name) ($($dns.IP)) - $failureRate% failure rate ($failures failures, $successes successes)" -Color Red
             }
         } else {
@@ -403,6 +662,173 @@ function Test-NetworkConnectivity {
     }
 }
 
+# Function to test IPv6 support (AAAA records)
+function Test-IPv6Support {
+    param(
+        [string]$dnsIP,
+        [string]$domain,
+        [int]$timeout = 3
+    )
+    
+    try {
+        $resolveJob = Start-Job -ScriptBlock { 
+            param($dnsIP, $domain)
+            try {
+                $result = Resolve-DnsName -Server $dnsIP -Name $domain -Type AAAA -ErrorAction Stop
+                # Check if we got valid IPv6 addresses
+                $ipv6Addresses = $result | Where-Object { $_.Type -eq 'AAAA' -and $_.IP6Address }
+                return @{
+                    Success = ($ipv6Addresses.Count -gt 0)
+                    AddressCount = $ipv6Addresses.Count
+                    Addresses = ($ipv6Addresses | Select-Object -First 2 -ExpandProperty IP6Address)
+                }
+            } catch {
+                return @{Success = $false; Error = $_.Exception.Message}
+            }
+        } -ArgumentList $dnsIP, $domain
+        
+        if (Wait-Job $resolveJob -Timeout $timeout) {
+            $result = Receive-Job $resolveJob
+            Remove-Job $resolveJob -Force
+            return $result
+        } else {
+            Remove-Job $resolveJob -Force
+            return @{Success = $false; Error = "Timeout"}
+        }
+    } catch {
+        return @{Success = $false; Error = $_.Exception.Message}
+    }
+}
+
+# Function to test DNSSEC validation support
+function Test-DNSSECSupport {
+    param(
+        [string]$dnsIP,
+        [int]$timeout = 3
+    )
+    
+    # Test with a known DNSSEC-enabled domain
+    $dnssecDomain = "cloudflare.com"  # Known to have DNSSEC
+    
+    try {
+        $resolveJob = Start-Job -ScriptBlock { 
+            param($dnsIP, $domain)
+            try {
+                # Try to resolve and check for DNSSEC-related records
+                $result = Resolve-DnsName -Server $dnsIP -Name $domain -Type A -DnssecOk -ErrorAction Stop
+                
+                # Check if DNSSEC data is present (AD flag or RRSIG records)
+                $hasDnssec = $false
+                
+                # Check for authenticated data flag or RRSIG presence
+                if ($result) {
+                    # Try to get DNSKEY records as a DNSSEC indicator
+                    $dnskeyResult = Resolve-DnsName -Server $dnsIP -Name $domain -Type DNSKEY -ErrorAction SilentlyContinue
+                    $hasDnssec = ($null -ne $dnskeyResult)
+                }
+                
+                return @{
+                    Success = $true
+                    DNSSECSupported = $hasDnssec
+                    ValidationAttempted = $true
+                }
+            } catch {
+                # If the query fails, DNS might not support DNSSEC properly
+                return @{
+                    Success = $true
+                    DNSSECSupported = $false
+                    ValidationAttempted = $true
+                    Error = $_.Exception.Message
+                }
+            }
+        } -ArgumentList $dnsIP, $dnssecDomain
+        
+        if (Wait-Job $resolveJob -Timeout $timeout) {
+            $result = Receive-Job $resolveJob
+            Remove-Job $resolveJob -Force
+            return $result
+        } else {
+            Remove-Job $resolveJob -Force
+            return @{Success = $false; DNSSECSupported = $false; ValidationAttempted = $false; Error = "Timeout"}
+        }
+    } catch {
+        return @{Success = $false; DNSSECSupported = $false; ValidationAttempted = $false; Error = $_.Exception.Message}
+    }
+}
+
+# Function to verify DNS response completeness and quality
+function Test-ResponseQuality {
+    param(
+        [string]$dnsIP,
+        [string]$domain,
+        [string]$recordType = "A",
+        [int]$timeout = 3
+    )
+    
+    try {
+        $resolveJob = Start-Job -ScriptBlock { 
+            param($dnsIP, $domain, $recordType)
+            try {
+                $result = Resolve-DnsName -Server $dnsIP -Name $domain -Type $recordType -ErrorAction Stop
+                
+                # Check response quality indicators
+                $quality = @{
+                    HasAnswer = $false
+                    AnswerCount = 0
+                    HasValidTTL = $false
+                    IsHijacked = $false
+                    IsComplete = $false
+                }
+                
+                if ($result) {
+                    $answers = $result | Where-Object { $_.Section -eq 'Answer' -or $_.Type -eq $recordType }
+                    $quality.HasAnswer = ($answers.Count -gt 0)
+                    $quality.AnswerCount = $answers.Count
+                    
+                    # Check for valid TTL (not 0 or suspiciously high)
+                    $ttlValues = $answers | Where-Object { $_.TTL } | Select-Object -ExpandProperty TTL
+                    if ($ttlValues) {
+                        $avgTTL = ($ttlValues | Measure-Object -Average).Average
+                        $quality.HasValidTTL = ($avgTTL -gt 0 -and $avgTTL -lt 86400)  # Between 0 and 1 day
+                    }
+                    
+                    # Check for NXDOMAIN hijacking (suspicious IPs like 127.0.0.1 or private ranges for public domains)
+                    if ($recordType -eq "A") {
+                        $ips = $answers | Where-Object { $_.IPAddress } | Select-Object -ExpandProperty IPAddress
+                        foreach ($ip in $ips) {
+                            # Check for common hijack IPs
+                            if ($ip -match '^127\.' -or $ip -match '^192\.168\.' -or $ip -match '^10\.' -or $ip -match '^172\.(1[6-9]|2[0-9]|3[0-1])\.') {
+                                $quality.IsHijacked = $true
+                                break
+                            }
+                        }
+                    }
+                    
+                    $quality.IsComplete = ($quality.HasAnswer -and $quality.HasValidTTL -and -not $quality.IsHijacked)
+                }
+                
+                return @{
+                    Success = $true
+                    Quality = $quality
+                }
+            } catch {
+                return @{Success = $false; Error = $_.Exception.Message}
+            }
+        } -ArgumentList $dnsIP, $domain, $recordType
+        
+        if (Wait-Job $resolveJob -Timeout $timeout) {
+            $result = Receive-Job $resolveJob
+            Remove-Job $resolveJob -Force
+            return $result
+        } else {
+            Remove-Job $resolveJob -Force
+            return @{Success = $false; Error = "Timeout"}
+        }
+    } catch {
+        return @{Success = $false; Error = $_.Exception.Message}
+    }
+}
+
 # Function to test DNS resolution time with jitter calculation
 function Test-DNS {
     param(
@@ -530,6 +956,37 @@ function Test-DNS {
         SuccessRate = ($successCount / $TestCount) * 100
         ActualTimeout = $currentTimeout
         Domain = $domain
+        IPv6Support = $null
+        DNSSECSupport = $null
+        ResponseQuality = $null
+    }
+}
+
+# Load persistent tracking history
+$global:PersistentHistory = Initialize-PersistentTracking
+
+# Handle reset tracking request
+if ($ResetTracking) {
+    if (Test-Path $global:PersistentTrackingFile) {
+        Remove-Item $global:PersistentTrackingFile -Force
+        Write-ColoredMessage "Persistent tracking history has been reset." -Color Green
+        $global:PersistentHistory = @{}
+    } else {
+        Write-ColoredMessage "No tracking history to reset." -Color Yellow
+    }
+    
+    if ($ShowTrackingStats) {
+        Show-TrackingStatistics -History $global:PersistentHistory
+    }
+    exit 0
+}
+
+# Show tracking stats if requested
+if ($ShowTrackingStats) {
+    Show-TrackingStatistics -History $global:PersistentHistory
+    if (-not $PSBoundParameters.ContainsKey('Domain')) {
+        # Exit if only showing stats
+        exit 0
     }
 }
 
@@ -537,20 +994,36 @@ function Test-DNS {
 Clear-Host
 Write-ColoredMessage "DNS Performance Test" -Color Cyan
 Write-ColoredMessage "===================" -Color Cyan
+if ($QuickTest) {
+    Write-ColoredMessage "Quick test mode: Reduced test count, enabled aggressive failure removal" -Color Yellow
+}
 Write-ColoredMessage "Testing DNS servers response time for: " -Color Yellow -NoNewline
 Write-ColoredMessage ($testDomains -join ', ') -Color Green
 Write-ColoredMessage "Mode: $(if ($Parallel) { 'Parallel' } else { 'Sequential' })" -Color Yellow
 Write-ColoredMessage "Testing $(if ($Category -eq 'All') { 'all' } else { $Category }) DNS providers" -Color Yellow
 Write-ColoredMessage "Record types: $($recordTypes -join ', ')" -Color Yellow
 Write-ColoredMessage "Tests per DNS: $TestCount with $Timeout second timeout" -Color Yellow
+
+# Show info about additional tests
+$additionalTests = @()
+if (-not $SkipIPv6Test) { $additionalTests += "IPv6" }
+if (-not $SkipDNSSECTest) { $additionalTests += "DNSSEC" }
+if (-not $SkipResponseVerification) { $additionalTests += "Quality" }
+if ($additionalTests.Count -gt 0) {
+    Write-ColoredMessage "Additional tests: $($additionalTests -join ', ')" -Color Cyan
+}
+
 if ($testDomains.Count -gt 1) {
     Write-ColoredMessage "Multi-domain testing: Testing each DNS server against $($testDomains.Count) domains" -Color Yellow
 }
 if ($AdaptiveTimeout) {
     Write-ColoredMessage "Adaptive timeout enabled: Egyptian DNS timeout = $EgyptianTimeout seconds" -Color Yellow
 }
-if ($RemoveFailingDNS) {
+if (-not $DisableFailureRemoval -or $AggressiveMode) {
     Write-ColoredMessage "Failure removal enabled: Max failure rate = $([math]::Round($MaxFailureRate * 100, 1))%, Threshold = $FailureThreshold consecutive failures" -Color Yellow
+    if ($AggressiveMode) {
+        Write-ColoredMessage "Aggressive mode: DNS servers will be removed immediately after first failure" -Color Yellow
+    }
 }
 Write-ColoredMessage "===================" -Color Cyan
 
@@ -569,6 +1042,51 @@ $filteredDnsProviders = if ($Category -eq "All") {
 if ($filteredDnsProviders.Count -eq 0) {
     Write-ColoredMessage "No DNS providers match the specified category: $Category" -Color Red
     exit 1
+}
+
+# Filter out blacklisted DNS providers
+if (-not $DisablePersistentTracking) {
+    $blacklistedIPs = Get-BlacklistedDNS -History $global:PersistentHistory
+    
+    if ($blacklistedIPs.Count -gt 0) {
+        Write-ColoredMessage "`nFiltering out $($blacklistedIPs.Count) blacklisted DNS server(s) from history..." -Color Yellow
+        
+        $beforeCount = $filteredDnsProviders.Count
+        $filteredDnsProviders = $filteredDnsProviders | Where-Object { 
+            $blacklistedIPs -notcontains $_.IP
+        }
+        $afterCount = $filteredDnsProviders.Count
+        
+        if ($beforeCount -ne $afterCount) {
+            Write-ColoredMessage "Removed $($beforeCount - $afterCount) DNS provider(s) due to persistent failures" -Color Yellow
+        }
+    }
+}
+
+if ($filteredDnsProviders.Count -eq 0) {
+    Write-ColoredMessage "No DNS providers remaining after filtering. Try -ResetTracking to start fresh." -Color Red
+    exit 1
+}
+
+# QuickTest optimization: Sort DNS providers by historical success
+if ($QuickTest -and -not $DisablePersistentTracking -and $global:PersistentHistory.Keys.Count -gt 0) {
+    Write-ColoredMessage "QuickTest: Prioritizing historically reliable DNS servers..." -Color Cyan
+    
+    $filteredDnsProviders = $filteredDnsProviders | Sort-Object {
+        $ip = $_.IP
+        if ($global:PersistentHistory.ContainsKey($ip)) {
+            $record = $global:PersistentHistory[$ip]
+            # Calculate reliability score (lower is better for sorting)
+            # Prioritize: high success count, low failure count
+            if ($record.TotalRuns -gt 0) {
+                $successRate = $record.SuccessCount / $record.TotalRuns
+                # Return negative success rate so higher success comes first
+                return -$successRate * 1000 - $record.TotalRuns
+            }
+        }
+        # Unknown DNS servers get tested last
+        return 0
+    }
 }
 
 # Create results array
@@ -743,6 +1261,9 @@ if ($Parallel) {
                     Jitter = if ($jobResult.Status -eq "Error") { "N/A" } else { "$($jobResult.Jitter) ms" }
                     RecordType = $jobResult.RecordType
                     SuccessRate = if ($jobResult.Status -eq "Error") { 0 } else { $jobResult.SuccessRate }
+                    IPv6 = "N/A"  # Parallel mode skips extended tests for speed
+                    DNSSEC = "N/A"
+                    Quality = "N/A"
                 }
             } else {
                 # If job failed entirely, record an error
@@ -755,6 +1276,9 @@ if ($Parallel) {
                     Jitter = "N/A"
                     RecordType = $recordType
                     SuccessRate = 0
+                    IPv6 = "N/A"
+                    DNSSEC = "N/A"
+                    Quality = "N/A"
                 }
                 Write-ColoredMessage "  Job failed for $($dns.Name)" -Color Red
             }
@@ -784,6 +1308,35 @@ if (-not $Parallel) {
             foreach ($recordType in $recordTypes) {
                 $result = Test-DNS -dnsIP $dns.IP -domain $testDomain -recordType $recordType -category $dns.Category -providerName $dns.Name
                 
+                # Run additional tests if enabled and main test succeeded
+                if ($result.Status -eq "Success") {
+                    # Test IPv6 support
+                    if (-not $SkipIPv6Test) {
+                        $ipv6Test = Test-IPv6Support -dnsIP $dns.IP -domain $testDomain -timeout $result.ActualTimeout
+                        $result.IPv6Support = $ipv6Test.Success
+                    }
+                    
+                    # Test DNSSEC support (only once per DNS, not per domain/record)
+                    if (-not $SkipDNSSECTest -and $null -eq $result.DNSSECSupport) {
+                        $dnssecTest = Test-DNSSECSupport -dnsIP $dns.IP -timeout $result.ActualTimeout
+                        $result.DNSSECSupport = $dnssecTest.DNSSECSupported
+                    }
+                    
+                    # Verify response quality
+                    if (-not $SkipResponseVerification) {
+                        $qualityTest = Test-ResponseQuality -dnsIP $dns.IP -domain $testDomain -recordType $recordType -timeout $result.ActualTimeout
+                        if ($qualityTest.Success) {
+                            $result.ResponseQuality = $qualityTest.Quality.IsComplete
+                        }
+                    }
+                }
+                
+                # Update persistent tracking
+                if (-not $DisablePersistentTracking) {
+                    $failed = ($result.Status -eq "Error")
+                    Update-PersistentTracking -History $global:PersistentHistory -DnsIP $dns.IP -Failed $failed
+                }
+                
                 $results += [PSCustomObject]@{
                     Provider = $dns.Name
                     IP = $dns.IP
@@ -794,13 +1347,79 @@ if (-not $Parallel) {
                     Jitter = if ($result.Status -eq "Error") { "N/A" } else { "$($result.Jitter) ms" }
                     RecordType = $result.RecordType
                     SuccessRate = if ($result.Status -eq "Error") { 0 } else { $result.SuccessRate }
+                    IPv6 = if ($null -eq $result.IPv6Support) { "N/A" } elseif ($result.IPv6Support) { "✓" } else { "✗" }
+                    DNSSEC = if ($null -eq $result.DNSSECSupport) { "N/A" } elseif ($result.DNSSECSupport) { "✓" } else { "✗" }
+                    Quality = if ($null -eq $result.ResponseQuality) { "N/A" } elseif ($result.ResponseQuality) { "✓" } else { "✗" }
                 }
             }
         }
         
-        # After testing each DNS provider, check if we should remove failing ones
-        if ($RemoveFailingDNS) {
-            $filteredDnsProviders = Remove-FailingDnsProviders -DnsProviders $filteredDnsProviders -FailureThreshold $FailureThreshold -MaxFailureRate $MaxFailureRate -ShowWarnings $ShowWarnings
+        # QuickTest early exit: Stop if we have enough good DNS servers
+        if ($QuickTest) {
+            $successfulResults = $results | Where-Object { $_.Status -eq "Success" }
+            $successfulByCategory = $successfulResults | Group-Object -Property Category
+            
+            # Check if we have enough successful DNS per category
+            $egyptianCount = ($successfulByCategory | Where-Object { $_.Name -eq "Egyptian" })
+            $globalCount = ($successfulByCategory | Where-Object { $_.Name -eq "Global" })
+            
+            $hasEnoughEgyptian = if ($egyptianCount) { $egyptianCount.Count -ge 4 } else { $false }
+            $hasEnoughGlobal = if ($globalCount) { $globalCount.Count -ge 10 } else { $false }
+            $hasEnoughControlD = ($successfulResults | Where-Object { $_.Category -eq "ControlD" }).Count -ge 2
+            
+            # If we have enough from each category, stop testing
+            if ($hasEnoughEgyptian -and $hasEnoughGlobal -and $hasEnoughControlD) {
+                Write-ColoredMessage "`nQuickTest: Found sufficient reliable DNS servers, stopping early..." -Color Cyan
+                break
+            }
+        }
+        
+        # After testing each DNS provider, check if THIS specific one should be removed
+        if (-not $DisableFailureRemoval -or $AggressiveMode) {
+            $shouldRemoveThis = Test-DnsRemoval -DnsIP $dns.IP -ProviderName $dns.Name -FailureThreshold $FailureThreshold -MaxFailureRate $MaxFailureRate
+            
+            if ($AggressiveMode) {
+                $key = "$($dns.IP)|$($dns.Name)"
+                if ($global:DnsFailureTracker.ContainsKey($key) -and $global:DnsFailureTracker[$key] -gt 0 -and $global:DnsSuccessTracker[$key] -eq 0) {
+                    $shouldRemoveThis = $true
+                }
+            }
+            
+            if ($shouldRemoveThis) {
+                $key = "$($dns.IP)|$($dns.Name)"
+                $failures = if ($global:DnsFailureTracker.ContainsKey($key)) { $global:DnsFailureTracker[$key] } else { 0 }
+                $successes = if ($global:DnsSuccessTracker.ContainsKey($key)) { $global:DnsSuccessTracker[$key] } else { 0 }
+                $totalTests = $failures + $successes
+                $failureRate = if ($totalTests -gt 0) { [math]::Round(($failures / $totalTests) * 100, 1) } else { 100 }
+                
+                # Update persistent tracking for this failure
+                if (-not $DisablePersistentTracking) {
+                    Update-PersistentTracking -History $global:PersistentHistory -DnsIP $dns.IP -Failed $true
+                }
+                
+                $global:RemovedDnsProviders += [PSCustomObject]@{
+                    Name = $dns.Name
+                    IP = $dns.IP
+                    Category = $dns.Category
+                    Failures = $failures
+                    Successes = $successes
+                    FailureRate = "$failureRate%"
+                    Reason = if ($AggressiveMode) { "Aggressive mode - Failed test" } elseif ($failures -ge $FailureThreshold -and $successes -eq 0) { "Consecutive failures" } else { "High failure rate" }
+                }
+                
+                if (-not $HideWarnings) {
+                    Write-ColoredMessage "  Removing $($dns.Name) ($($dns.IP)) - $failureRate% failure rate ($failures failures, $successes successes)" -Color Red
+                }
+                
+                # Remove this DNS from the list by filtering it out
+                $filteredDnsProviders = $filteredDnsProviders | Where-Object { $_.IP -ne $dns.IP -or $_.Name -ne $dns.Name }
+                
+                # Check if too many DNS providers were removed
+                if ($filteredDnsProviders.Count -lt ($dnsProviders.Count / 2)) {
+                    Write-ColoredMessage "Warning: More than half of the DNS providers have been removed due to failures." -Color Yellow
+                    Write-ColoredMessage "This might indicate network connectivity issues. Consider running the test again." -Color Yellow
+                }
+            }
         }
     }
 }
@@ -808,6 +1427,85 @@ if (-not $Parallel) {
 # Check if we have any results
 if ($results.Count -eq 0) {
     Write-ColoredMessage "`nNo results were gathered. Please check your network connection and try again." -Color Red
+    exit 1
+}
+
+# Function to filter out DNS providers that failed all tests
+function Remove-CompletelyFailedDNS {
+    param (
+        [Array]$ResultsData
+    )
+    
+    # Group results by DNS provider (Name + IP combination)
+    $dnsGroups = $ResultsData | Group-Object { "$($_.Provider)|$($_.IP)" }
+    
+    $validResults = @()
+    $removedProviders = @()
+    
+    foreach ($group in $dnsGroups) {
+        $providerResults = $group.Group
+        $totalTests = $providerResults.Count
+        $failedTests = ($providerResults | Where-Object { $_.Status -eq "Error" -or $_.SuccessRate -eq 0 -or $_.ResponseTime -eq "Timeout" }).Count
+        
+        # Calculate failure rate
+        $failureRate = if ($totalTests -gt 0) { ($failedTests / $totalTests) * 100 } else { 100 }
+        
+        # If provider failed ALL tests (100% failure rate), remove it
+        if ($failureRate -eq 100) {
+            $removedProvider = $providerResults[0] # Get provider info from first result
+            $removedProviders += [PSCustomObject]@{
+                Name = $removedProvider.Provider
+                IP = $removedProvider.IP
+                Category = $removedProvider.Category
+                TotalTests = $totalTests
+                FailedTests = $failedTests
+                FailureRate = "100%"
+                Reason = "Failed all tests across all domains and record types"
+            }
+            
+            Write-ColoredMessage "  Removing $($removedProvider.Provider) ($($removedProvider.IP)) - Failed all $totalTests tests" -Color Red
+        } else {
+            # Keep this provider's results
+            $validResults += $providerResults
+        }
+    }
+    
+    if ($removedProviders.Count -gt 0) {
+        Write-ColoredMessage "`nRemoved $($removedProviders.Count) DNS provider(s) that failed all tests:" -Color Yellow
+        $removedProviders | Format-Table -AutoSize -Property Name, IP, Category, TotalTests, Reason | Out-Host
+        
+        # Add to global removed providers list
+        foreach ($removed in $removedProviders) {
+            $global:RemovedDnsProviders += [PSCustomObject]@{
+                Name = $removed.Name
+                IP = $removed.IP
+                Category = $removed.Category
+                Failures = $removed.TotalTests
+                Successes = 0
+                FailureRate = "100%"
+                Reason = "Failed all tests"
+            }
+        }
+    }
+    
+    return $validResults
+}
+
+# Remove DNS providers that failed all tests
+Write-ColoredMessage "`nFiltering out DNS providers that failed all tests..." -Color Yellow
+$originalCount = $results.Count
+$filteredResults = Remove-CompletelyFailedDNS -ResultsData $results
+$removedCount = $originalCount - $filteredResults.Count
+
+if ($removedCount -gt 0) {
+    Write-ColoredMessage "Filtered out $removedCount results from DNS providers that failed all tests." -Color Yellow
+    $results = $filteredResults
+}
+
+# Check if we have any valid results after filtering
+if ($results.Count -eq 0) {
+    Write-ColoredMessage "`nNo valid DNS results remain after filtering. All tested DNS servers failed completely." -Color Red
+    Write-ColoredMessage "This might indicate a network connectivity issue. Please check your internet connection and try again." -Color Red
     exit 1
 }
 
@@ -834,27 +1532,39 @@ if ($recordTypes.Count -gt 1) {
                 Format-Table -AutoSize -Property @{
                     Label = "Provider"
                     Expression = { $_.Provider }
-                    Width = 30
+                    Width = 25
                 }, @{
                     Label = "IP Address"
                     Expression = { $_.IP }
-                    Width = 20
+                    Width = 15
                 }, @{
                     Label = "Domain"
                     Expression = { $_.Domain }
-                    Width = 20
+                    Width = 18
                 }, @{
                     Label = "Response Time"
                     Expression = { $_.ResponseTime }
-                    Width = 15
+                    Width = 13
                 }, @{
                     Label = "Jitter"
                     Expression = { $_.Jitter }
-                    Width = 10
+                    Width = 8
                 }, @{
-                    Label = "Success Rate"
+                    Label = "Success"
                     Expression = { if ($_.Status -eq "Error") { "0%" } else { "$($_.SuccessRate)%" } }
-                    Width = 12
+                    Width = 8
+                }, @{
+                    Label = "IPv6"
+                    Expression = { $_.IPv6 }
+                    Width = 5
+                }, @{
+                    Label = "DNSSEC"
+                    Expression = { $_.DNSSEC }
+                    Width = 7
+                }, @{
+                    Label = "Quality"
+                    Expression = { $_.Quality }
+                    Width = 7
                 } | Out-Host
         } else {
             Write-ColoredMessage "  No results for $recordType records." -Color Red
@@ -875,27 +1585,39 @@ if ($recordTypes.Count -gt 1) {
         Format-Table -AutoSize -Property @{
             Label = "Provider"
             Expression = { $_.Provider }
-            Width = 30
+            Width = 25
         }, @{
             Label = "IP Address"
             Expression = { $_.IP }
-            Width = 20
+            Width = 15
         }, @{
             Label = "Domain"
             Expression = { $_.Domain }
-            Width = 20
+            Width = 18
         }, @{
             Label = "Response Time"
             Expression = { $_.ResponseTime }
-            Width = 15
+            Width = 13
         }, @{
             Label = "Jitter"
             Expression = { $_.Jitter }
-            Width = 10
+            Width = 8
         }, @{
-            Label = "Success Rate"
+            Label = "Success"
             Expression = { if ($_.Status -eq "Error") { "0%" } else { "$([math]::Round($_.SuccessRate))%" } }
-            Width = 12
+            Width = 8
+        }, @{
+            Label = "IPv6"
+            Expression = { $_.IPv6 }
+            Width = 5
+        }, @{
+            Label = "DNSSEC"
+            Expression = { $_.DNSSEC }
+            Width = 7
+        }, @{
+            Label = "Quality"
+            Expression = { $_.Quality }
+            Width = 7
         } | Out-Host
 }
 
@@ -1002,6 +1724,431 @@ function Get-BestDNSPair {
     }
 }
 
+function Get-BestMixedPair {
+    <#
+    .SYNOPSIS
+    Gets the best mixed DNS pair (one Egyptian, one Global)
+    #>
+    param (
+        [Array]$DNSResults,
+        [string]$RecordType = "A"
+    )
+    
+    $egyptianResults = $DNSResults | Where-Object { 
+        $_.Status -eq "Success" -and $_.RecordType -eq $RecordType -and $_.Category -eq "Egyptian"
+    }
+    
+    $globalResults = $DNSResults | Where-Object { 
+        $_.Status -eq "Success" -and $_.RecordType -eq $RecordType -and $_.Category -eq "Global"
+    }
+    
+    if ($egyptianResults.Count -eq 0 -or $globalResults.Count -eq 0) {
+        return $null
+    }
+    
+    # Score each DNS
+    $scoredEgyptian = $egyptianResults | ForEach-Object {
+        $responseTime = [double]($_.ResponseTime -replace ' ms$', '')
+        $jitter = if ($_.Jitter -eq "N/A") { 0 } else { [double]($_.Jitter -replace ' ms$', '') }
+        $successRate = [double]($_.SuccessRate)
+        $score = ($responseTime * 0.6) + ($jitter * 0.2) - ($successRate * 0.02)
+        
+        [PSCustomObject]@{
+            Provider = $_.Provider
+            IP = $_.IP
+            ResponseTime = $_.ResponseTime
+            Jitter = $_.Jitter
+            SuccessRate = $_.SuccessRate
+            Score = $score
+            Category = "Egyptian"
+        }
+    }
+    
+    $scoredGlobal = $globalResults | ForEach-Object {
+        $responseTime = [double]($_.ResponseTime -replace ' ms$', '')
+        $jitter = if ($_.Jitter -eq "N/A") { 0 } else { [double]($_.Jitter -replace ' ms$', '') }
+        $successRate = [double]($_.SuccessRate)
+        $score = ($responseTime * 0.6) + ($jitter * 0.2) - ($successRate * 0.02)
+        
+        [PSCustomObject]@{
+            Provider = $_.Provider
+            IP = $_.IP
+            ResponseTime = $_.ResponseTime
+            Jitter = $_.Jitter
+            SuccessRate = $_.SuccessRate
+            Score = $score
+            Category = "Global"
+        }
+    }
+    
+    $bestEgyptian = $scoredEgyptian | Sort-Object Score | Select-Object -First 1
+    $bestGlobal = $scoredGlobal | Sort-Object Score | Select-Object -First 1
+    
+    # Return Egyptian as primary if it's faster, otherwise Global
+    if ($bestEgyptian.Score -le $bestGlobal.Score) {
+        return @{
+            Primary = $bestEgyptian
+            Secondary = $bestGlobal
+            Type = "Mixed (Egyptian Primary)"
+            AverageScore = ($bestEgyptian.Score + $bestGlobal.Score) / 2
+        }
+    } else {
+        return @{
+            Primary = $bestGlobal
+            Secondary = $bestEgyptian
+            Type = "Mixed (Global Primary)"
+            AverageScore = ($bestEgyptian.Score + $bestGlobal.Score) / 2
+        }
+    }
+}
+
+function Get-BestOverallPair {
+    <#
+    .SYNOPSIS
+    Gets the absolute best DNS pair regardless of category
+    #>
+    param (
+        [Array]$DNSResults,
+        [string]$RecordType = "A"
+    )
+    
+    $filteredResults = $DNSResults | Where-Object { 
+        $_.Status -eq "Success" -and $_.RecordType -eq $RecordType
+    }
+    
+    if ($filteredResults.Count -eq 0) {
+        return $null
+    }
+    
+    $scoredDNS = $filteredResults | ForEach-Object {
+        $responseTime = [double]($_.ResponseTime -replace ' ms$', '')
+        $jitter = if ($_.Jitter -eq "N/A") { 0 } else { [double]($_.Jitter -replace ' ms$', '') }
+        $successRate = [double]($_.SuccessRate)
+        $score = ($responseTime * 0.6) + ($jitter * 0.2) - ($successRate * 0.02)
+        
+        [PSCustomObject]@{
+            Provider = $_.Provider
+            IP = $_.IP
+            ResponseTime = $_.ResponseTime
+            Jitter = $_.Jitter
+            SuccessRate = $_.SuccessRate
+            Score = $score
+            Category = $_.Category
+        }
+    }
+    
+    $primary = $scoredDNS | Sort-Object Score | Select-Object -First 1
+    $secondary = $scoredDNS | 
+        Where-Object { $_.IP -ne $primary.IP } |
+        Sort-Object Score |
+        Select-Object -First 1
+    
+    if (-not $secondary) {
+        $secondary = $primary
+    }
+    
+    return @{
+        Primary = $primary
+        Secondary = $secondary
+        Type = "Best Overall"
+        AverageScore = ($primary.Score + $secondary.Score) / 2
+    }
+}
+
+function Get-MostReliablePair {
+    <#
+    .SYNOPSIS
+    Gets the most reliable DNS pair based on success rate
+    #>
+    param (
+        [Array]$DNSResults,
+        [string]$RecordType = "A"
+    )
+    
+    $filteredResults = $DNSResults | Where-Object { 
+        $_.Status -eq "Success" -and $_.RecordType -eq $RecordType
+    }
+    
+    if ($filteredResults.Count -eq 0) {
+        return $null
+    }
+    
+    $scoredDNS = $filteredResults | ForEach-Object {
+        $responseTime = [double]($_.ResponseTime -replace ' ms$', '')
+        $successRate = [double]($_.SuccessRate)
+        
+        [PSCustomObject]@{
+            Provider = $_.Provider
+            IP = $_.IP
+            ResponseTime = $_.ResponseTime
+            Jitter = $_.Jitter
+            SuccessRate = $_.SuccessRate
+            Category = $_.Category
+        }
+    } | Sort-Object @{Expression={$_.SuccessRate}; Descending=$true}, @{Expression={[double]($_.ResponseTime -replace ' ms$', '')}; Ascending=$true}
+    
+    $primary = $scoredDNS | Select-Object -First 1
+    $secondary = $scoredDNS | 
+        Where-Object { $_.IP -ne $primary.IP } |
+        Select-Object -First 1
+    
+    if (-not $secondary) {
+        $secondary = $primary
+    }
+    
+    return @{
+        Primary = $primary
+        Secondary = $secondary
+        Type = "Most Reliable"
+        AverageSuccessRate = ($primary.SuccessRate + $secondary.SuccessRate) / 2
+    }
+}
+
+function Get-LowLatencyPair {
+    <#
+    .SYNOPSIS
+    Gets the lowest latency DNS pair (focuses on response time)
+    #>
+    param (
+        [Array]$DNSResults,
+        [string]$RecordType = "A"
+    )
+    
+    $filteredResults = $DNSResults | Where-Object { 
+        $_.Status -eq "Success" -and $_.RecordType -eq $RecordType
+    }
+    
+    if ($filteredResults.Count -eq 0) {
+        return $null
+    }
+    
+    $scoredDNS = $filteredResults | ForEach-Object {
+        $responseTime = [double]($_.ResponseTime -replace ' ms$', '')
+        
+        [PSCustomObject]@{
+            Provider = $_.Provider
+            IP = $_.IP
+            ResponseTime = $responseTime
+            Jitter = $_.Jitter
+            SuccessRate = $_.SuccessRate
+            Category = $_.Category
+        }
+    } | Sort-Object ResponseTime
+    
+    $primary = $scoredDNS | Select-Object -First 1
+    $secondary = $scoredDNS | 
+        Where-Object { $_.IP -ne $primary.IP } |
+        Select-Object -First 1
+    
+    if (-not $secondary) {
+        $secondary = $primary
+    }
+    
+    return @{
+        Primary = $primary
+        Secondary = $secondary
+        Type = "Lowest Latency"
+        AverageLatency = ($primary.ResponseTime + $secondary.ResponseTime) / 2
+    }
+}
+
+function Get-BestSameProviderPair {
+    <#
+    .SYNOPSIS
+    Gets the best DNS pair from the same provider (e.g., Quad9 + Quad9 Secondary, NOT Quad9 + Quad9 Unsecured)
+    Only matches strict primary/secondary pairs, not different variants of the same provider
+    #>
+    param (
+        [Array]$DNSResults,
+        [string]$RecordType = "A"
+    )
+    
+    $filteredResults = $DNSResults | Where-Object { 
+        $_.Status -eq "Success" -and $_.RecordType -eq $RecordType
+    }
+    
+    if ($filteredResults.Count -eq 0) {
+        return $null
+    }
+    
+    # Score each DNS
+    $scoredDNS = $filteredResults | ForEach-Object {
+        $responseTime = [double]($_.ResponseTime -replace ' ms$', '')
+        $jitter = if ($_.Jitter -eq "N/A") { 0 } else { [double]($_.Jitter -replace ' ms$', '') }
+        $successRate = [double]($_.SuccessRate)
+        $score = ($responseTime * 0.6) + ($jitter * 0.2) - ($successRate * 0.02)
+        
+        # More strict base provider extraction
+        # Only remove "Secondary", "Alt", "2", "3" that are clearly secondary indicators
+        # Keep variant names like "Unsecured", "Secure", "Family", etc.
+        $baseProvider = $_.Provider
+        
+        # Check if this is a secondary/alternate server
+        $isSecondary = $false
+        if ($_.Provider -match '\s+(Secondary|Alt)\s*\d*$') {
+            $isSecondary = $true
+            $baseProvider = $_.Provider -replace '\s+(Secondary|Alt)\s*\d*$', ''
+        } elseif ($_.Provider -match '\s+\d+$' -and $_.Provider -notmatch '(Quad9|DNS)\s+\d+$') {
+            # Only remove trailing numbers if they're not part of the name (like "Quad9" or "DNS")
+            $isSecondary = $true
+            $baseProvider = $_.Provider -replace '\s+\d+$', ''
+        }
+        
+        $baseProvider = $baseProvider.Trim()
+        
+        [PSCustomObject]@{
+            Provider = $_.Provider
+            BaseProvider = $baseProvider
+            IsSecondary = $isSecondary
+            IP = $_.IP
+            ResponseTime = $_.ResponseTime
+            Jitter = $_.Jitter
+            SuccessRate = $_.SuccessRate
+            Score = $score
+            Category = $_.Category
+            NumericResponseTime = $responseTime
+        }
+    }
+    
+    # Group by base provider - only consider groups that have both primary and secondary
+    $providerGroups = $scoredDNS | Group-Object BaseProvider
+    
+    $bestProviderPair = $null
+    $bestPairScore = [double]::MaxValue
+    
+    foreach ($group in $providerGroups) {
+        # Must have at least one primary and one secondary
+        $primaries = $group.Group | Where-Object { -not $_.IsSecondary }
+        $secondaries = $group.Group | Where-Object { $_.IsSecondary }
+        
+        if ($primaries.Count -eq 0 -or $secondaries.Count -eq 0) {
+            continue
+        }
+        
+        # Get best primary and best secondary from this provider
+        $primary = $primaries | Sort-Object Score | Select-Object -First 1
+        $secondary = $secondaries | Sort-Object Score | Select-Object -First 1
+        
+        if ($primary -and $secondary -and $primary.IP -ne $secondary.IP) {
+            $pairScore = ($primary.Score + $secondary.Score) / 2
+            
+            # Keep track of the best pair across all providers
+            if ($pairScore -lt $bestPairScore) {
+                $bestPairScore = $pairScore
+                $bestProviderPair = @{
+                    Primary = $primary
+                    Secondary = $secondary
+                    ProviderName = $group.Name
+                    Type = "Best Same Provider"
+                    AverageScore = $pairScore
+                    AverageLatency = ($primary.NumericResponseTime + $secondary.NumericResponseTime) / 2
+                }
+            }
+        }
+    }
+    
+    return $bestProviderPair
+}
+
+# Function to get the best same-provider pair for global providers only
+function Get-BestSameProviderPairGlobal {
+    <#
+    .SYNOPSIS
+    Gets the best DNS pair from the same global provider (e.g., Quad9 + Quad9 Secondary, NOT Quad9 + Quad9 Unsecured)
+    Only matches strict primary/secondary pairs, not different variants of the same provider
+    #>
+    param (
+        [Array]$DNSResults,
+        [string]$RecordType = "A"
+    )
+    
+    $filteredResults = $DNSResults | Where-Object { 
+        $_.Status -eq "Success" -and $_.RecordType -eq $RecordType -and $_.Category -eq "Global"
+    }
+    
+    if ($filteredResults.Count -eq 0) {
+        return $null
+    }
+
+    # Score each DNS
+    $scoredDNS = $filteredResults | ForEach-Object {
+        $responseTime = [double]($_.ResponseTime -replace ' ms$', '')
+        $jitter = if ($_.Jitter -eq "N/A") { 0 } else { [double]($_.Jitter -replace ' ms$', '') }
+        $successRate = [double]($_.SuccessRate)
+        $score = ($responseTime * 0.6) + ($jitter * 0.2) - ($successRate * 0.02)
+        
+        # More strict base provider extraction
+        # Only remove "Secondary", "Alt", "2", "3" that are clearly secondary indicators
+        # Keep variant names like "Unsecured", "Secure", "Family", etc.
+        $baseProvider = $_.Provider
+        
+        # Check if this is a secondary/alternate server
+        $isSecondary = $false
+        if ($_.Provider -match '\s+(Secondary|Alt)\s*\d*$') {
+            $isSecondary = $true
+            $baseProvider = $_.Provider -replace '\s+(Secondary|Alt)\s*\d*$', ''
+        } elseif ($_.Provider -match '\s+\d+$' -and $_.Provider -notmatch '(Quad9|DNS)\s+\d+$') {
+            # Only remove trailing numbers if they're not part of the name (like "Quad9" or "DNS")
+            $isSecondary = $true
+            $baseProvider = $_.Provider -replace '\s+\d+$', ''
+        }
+        
+        $baseProvider = $baseProvider.Trim()
+        
+        [PSCustomObject]@{
+            Provider = $_.Provider
+            BaseProvider = $baseProvider
+            IsSecondary = $isSecondary
+            IP = $_.IP
+            ResponseTime = $_.ResponseTime
+            Jitter = $_.Jitter
+            SuccessRate = $_.SuccessRate
+            Score = $score
+            Category = $_.Category
+            NumericResponseTime = $responseTime
+        }
+    }
+
+    # Group by base provider - only consider groups that have both primary and secondary
+    $providerGroups = $scoredDNS | Group-Object BaseProvider
+    
+    $bestProviderPair = $null
+    $bestPairScore = [double]::MaxValue
+    
+    foreach ($group in $providerGroups) {
+        # Must have at least one primary and one secondary
+        $primaries = $group.Group | Where-Object { -not $_.IsSecondary }
+        $secondaries = $group.Group | Where-Object { $_.IsSecondary }
+        
+        if ($primaries.Count -eq 0 -or $secondaries.Count -eq 0) {
+            continue
+        }
+        
+        # Get best primary and best secondary from this provider
+        $primary = $primaries | Sort-Object Score | Select-Object -First 1
+        $secondary = $secondaries | Sort-Object Score | Select-Object -First 1
+        
+        if ($primary -and $secondary -and $primary.IP -ne $secondary.IP) {
+            $pairScore = ($primary.Score + $secondary.Score) / 2
+            
+            # Keep track of the best pair across all providers
+            if ($pairScore -lt $bestPairScore) {
+                $bestPairScore = $pairScore
+                $bestProviderPair = @{
+                    Primary = $primary
+                    Secondary = $secondary
+                    ProviderName = $group.Name
+                    Type = "Best Same Provider (Global)"
+                    AverageScore = $pairScore
+                    AverageLatency = ($primary.NumericResponseTime + $secondary.NumericResponseTime) / 2
+                }
+            }
+        }
+    }
+    
+    return $bestProviderPair
+}
+
 # Process results by category
 $categoryResults = @{}
 $categoryStats = @{}
@@ -1026,59 +2173,436 @@ Write-ColoredMessage "===================" -Color Cyan
 foreach ($recordType in $recordTypes) {
     if ($recordTypes.Count -gt 1) {
         Write-ColoredMessage "`n[$recordType Records]" -Color Magenta
-    }      # Get statistics for each category
+    }
+    
+    # Get statistics for each category
     $egyptianStats = $categoryStats["Egyptian_${recordType}"]
     $globalStats = $categoryStats["Global_${recordType}"]
     
     # Get best pairs for each category
     $bestEgyptianPair = $bestPairs["Egyptian_${recordType}"]
-    $bestGlobalPair = $bestPairs["Global_${recordType}"]# Display Egyptian results
-    Write-ColoredMessage "`nBest Egyptian DNS Configuration:" -Color Yellow
+    $bestGlobalPair = $bestPairs["Global_${recordType}"]
+    
+    # Get additional pairing options
+    $bestMixedPair = Get-BestMixedPair -DNSResults $results -RecordType $recordType
+    $bestOverallPair = Get-BestOverallPair -DNSResults $results -RecordType $recordType
+    $mostReliablePair = Get-MostReliablePair -DNSResults $results -RecordType $recordType
+    $lowLatencyPair = Get-LowLatencyPair -DNSResults $results -RecordType $recordType
+    $bestSameProviderPair = Get-BestSameProviderPair -DNSResults $results -RecordType $recordType
+    $bestSameProviderPairGlobal = Get-BestSameProviderPairGlobal -DNSResults $results -RecordType $recordType
+    
+    # Display all pairing options
+    Write-ColoredMessage "`n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -Color Cyan
+    Write-ColoredMessage "DNS PAIRING OPTIONS" -Color Cyan
+    Write-ColoredMessage "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -Color Cyan
+    
+    # Option 1: Best Egyptian
+    Write-ColoredMessage "`n[1] Best Egyptian DNS Configuration:" -Color Yellow
     if ($bestEgyptianPair -and $bestEgyptianPair.Primary -and $bestEgyptianPair.Secondary) {
-        Write-ColoredMessage "Primary:   $($bestEgyptianPair.Primary.IP) ($($bestEgyptianPair.Primary.Provider)) - $($bestEgyptianPair.Primary.ResponseTime) (Jitter: $($bestEgyptianPair.Primary.Jitter))" -Color Green
-        Write-ColoredMessage "Secondary: $($bestEgyptianPair.Secondary.IP) ($($bestEgyptianPair.Secondary.Provider)) - $($bestEgyptianPair.Secondary.ResponseTime) (Jitter: $($bestEgyptianPair.Secondary.Jitter))" -Color Green
+        Write-Host "    Primary:   " -NoNewline -ForegroundColor White
+        Write-Host "$($bestEgyptianPair.Primary.IP)" -NoNewline -ForegroundColor Cyan
+        Write-Host " (" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestEgyptianPair.Primary.Provider)" -NoNewline -ForegroundColor Magenta
+        Write-Host ") - " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestEgyptianPair.Primary.ResponseTime)" -NoNewline -ForegroundColor Green
+        Write-Host " (Jitter: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestEgyptianPair.Primary.Jitter)" -NoNewline -ForegroundColor Yellow
+        Write-Host ")" -ForegroundColor DarkGray
+        
+        Write-Host "    Secondary: " -NoNewline -ForegroundColor White
+        Write-Host "$($bestEgyptianPair.Secondary.IP)" -NoNewline -ForegroundColor Cyan
+        Write-Host " (" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestEgyptianPair.Secondary.Provider)" -NoNewline -ForegroundColor Magenta
+        Write-Host ") - " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestEgyptianPair.Secondary.ResponseTime)" -NoNewline -ForegroundColor Green
+        Write-Host " (Jitter: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestEgyptianPair.Secondary.Jitter)" -NoNewline -ForegroundColor Yellow
+        Write-Host ")" -ForegroundColor DarkGray
+        
+        Write-ColoredMessage "    ✓ Pro: Local servers, potentially less censorship" -Color DarkGreen
+        Write-ColoredMessage "    ✗ Con: May have reliability issues" -Color DarkYellow
         
         if ($egyptianStats) {
-            Write-ColoredMessage "Statistics:" -Color Gray
-            Write-ColoredMessage "  Min: $([math]::Round($egyptianStats.Min, 2)) ms" -Color Gray
-            Write-ColoredMessage "  Max: $([math]::Round($egyptianStats.Max, 2)) ms" -Color Gray
-            Write-ColoredMessage "  Avg: $([math]::Round($egyptianStats.Avg, 2)) ms" -Color Gray
-            Write-ColoredMessage "  Avg Jitter: $([math]::Round($egyptianStats.AvgJitter, 2)) ms" -Color Gray
-            Write-ColoredMessage "  Successful Tests: $($egyptianStats.Count)" -Color Gray
-        }    } else {
-        Write-ColoredMessage "No valid Egyptian DNS pair found for $recordType records." -Color Red
-    }
-
-    # Display Global results
-    Write-ColoredMessage "`nBest Global DNS Configuration:" -Color Yellow
-    if ($bestGlobalPair -and $bestGlobalPair.Primary -and $bestGlobalPair.Secondary) {
-        Write-ColoredMessage "Primary:   $($bestGlobalPair.Primary.IP) ($($bestGlobalPair.Primary.Provider)) - $($bestGlobalPair.Primary.ResponseTime) (Jitter: $($bestGlobalPair.Primary.Jitter))" -Color Green
-        Write-ColoredMessage "Secondary: $($bestGlobalPair.Secondary.IP) ($($bestGlobalPair.Secondary.Provider)) - $($bestGlobalPair.Secondary.ResponseTime) (Jitter: $($bestGlobalPair.Secondary.Jitter))" -Color Green
-        
-        if ($globalStats) {
-            Write-ColoredMessage "Statistics:" -Color Gray
-            Write-ColoredMessage "  Min: $([math]::Round($globalStats.Min, 2)) ms" -Color Gray
-            Write-ColoredMessage "  Max: $([math]::Round($globalStats.Max, 2)) ms" -Color Gray
-            Write-ColoredMessage "  Avg: $([math]::Round($globalStats.Avg, 2)) ms" -Color Gray
-            Write-ColoredMessage "  Avg Jitter: $([math]::Round($globalStats.AvgJitter, 2)) ms" -Color Gray
-            Write-ColoredMessage "  Successful Tests: $($globalStats.Count)" -Color Gray
+            Write-Host "    Stats: Avg: " -NoNewline -ForegroundColor White
+            Write-Host "$([math]::Round($egyptianStats.Avg, 2)) ms" -NoNewline -ForegroundColor Cyan
+            Write-Host " | Jitter: " -NoNewline -ForegroundColor White
+            Write-Host "$([math]::Round($egyptianStats.AvgJitter, 2)) ms" -ForegroundColor Cyan
         }
     } else {
-        Write-ColoredMessage "No valid Global DNS pair found for $recordType records." -Color Red
-    }    # Overall recommendation
-    Write-ColoredMessage "`nRecommendation for $recordType records:" -Color Cyan
-    $validStats = @()
-    if ($egyptianStats) { $validStats += @{Name = "Egyptian"; Avg = $egyptianStats.Avg; Jitter = $egyptianStats.AvgJitter; Pair = $bestEgyptianPair} }
-    if ($globalStats) { $validStats += @{Name = "Global"; Avg = $globalStats.Avg; Jitter = $globalStats.AvgJitter; Pair = $bestGlobalPair} }
-    
-    if ($validStats.Count -gt 0) {
-        # Sort categories by average response time (lower is better)
-        $bestCategoryStats = $validStats | Sort-Object Avg | Select-Object -First 1
-        Write-ColoredMessage "Use $($bestCategoryStats.Name) DNS configuration for best performance (Avg: $([math]::Round($bestCategoryStats.Avg, 2)) ms, Jitter: $([math]::Round($bestCategoryStats.Jitter, 2)) ms)" -Color Green
+        Write-ColoredMessage "    No valid Egyptian DNS pair found" -Color Red
+    }
+
+    # Option 2: Best Global
+    Write-ColoredMessage "`n[2] Best Global DNS Configuration:" -Color Yellow
+    if ($bestGlobalPair -and $bestGlobalPair.Primary -and $bestGlobalPair.Secondary) {
+        Write-Host "    Primary:   " -NoNewline -ForegroundColor White
+        Write-Host "$($bestGlobalPair.Primary.IP)" -NoNewline -ForegroundColor Cyan
+        Write-Host " (" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestGlobalPair.Primary.Provider)" -NoNewline -ForegroundColor Magenta
+        Write-Host ") - " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestGlobalPair.Primary.ResponseTime)" -NoNewline -ForegroundColor Green
+        Write-Host " (Jitter: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestGlobalPair.Primary.Jitter)" -NoNewline -ForegroundColor Yellow
+        Write-Host ")" -ForegroundColor DarkGray
+        
+        Write-Host "    Secondary: " -NoNewline -ForegroundColor White
+        Write-Host "$($bestGlobalPair.Secondary.IP)" -NoNewline -ForegroundColor Cyan
+        Write-Host " (" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestGlobalPair.Secondary.Provider)" -NoNewline -ForegroundColor Magenta
+        Write-Host ") - " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestGlobalPair.Secondary.ResponseTime)" -NoNewline -ForegroundColor Green
+        Write-Host " (Jitter: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestGlobalPair.Secondary.Jitter)" -NoNewline -ForegroundColor Yellow
+        Write-Host ")" -ForegroundColor DarkGray
+        
+        Write-ColoredMessage "    ✓ Pro: Highly reliable, global infrastructure" -Color DarkGreen
+        Write-ColoredMessage "    ✗ Con: May be slower from Egypt" -Color DarkYellow
+        
+        if ($globalStats) {
+            Write-Host "    Stats: Avg: " -NoNewline -ForegroundColor White
+            Write-Host "$([math]::Round($globalStats.Avg, 2)) ms" -NoNewline -ForegroundColor Cyan
+            Write-Host " | Jitter: " -NoNewline -ForegroundColor White
+            Write-Host "$([math]::Round($globalStats.AvgJitter, 2)) ms" -ForegroundColor Cyan
+        }
     } else {
-        Write-ColoredMessage "No valid DNS configurations found for $recordType records." -Color Red
+        Write-ColoredMessage "    No valid Global DNS pair found" -Color Red
+    }
+    
+    # Option 3: Best Mixed
+    Write-ColoredMessage "`n[3] Best Mixed Configuration (Egyptian + Global):" -Color Yellow
+    if ($bestMixedPair) {
+        Write-Host "    Primary:   " -NoNewline -ForegroundColor White
+        Write-Host "$($bestMixedPair.Primary.IP)" -NoNewline -ForegroundColor Cyan
+        Write-Host " (" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestMixedPair.Primary.Provider)" -NoNewline -ForegroundColor Magenta
+        Write-Host ") - " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestMixedPair.Primary.ResponseTime)" -NoNewline -ForegroundColor Green
+        Write-Host " (Jitter: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestMixedPair.Primary.Jitter)" -NoNewline -ForegroundColor Yellow
+        Write-Host ") [" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestMixedPair.Primary.Category)" -NoNewline -ForegroundColor Blue
+        Write-Host "]" -ForegroundColor DarkGray
+        
+        Write-Host "    Secondary: " -NoNewline -ForegroundColor White
+        Write-Host "$($bestMixedPair.Secondary.IP)" -NoNewline -ForegroundColor Cyan
+        Write-Host " (" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestMixedPair.Secondary.Provider)" -NoNewline -ForegroundColor Magenta
+        Write-Host ") - " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestMixedPair.Secondary.ResponseTime)" -NoNewline -ForegroundColor Green
+        Write-Host " (Jitter: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestMixedPair.Secondary.Jitter)" -NoNewline -ForegroundColor Yellow
+        Write-Host ") [" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestMixedPair.Secondary.Category)" -NoNewline -ForegroundColor Blue
+        Write-Host "]" -ForegroundColor DarkGray
+        
+        Write-ColoredMessage "    ✓ Pro: Balanced approach, failover between local and global" -Color DarkGreen
+        Write-ColoredMessage "    ✗ Con: Performance varies by location" -Color DarkYellow
+        Write-Host "    Stats: Avg Score: " -NoNewline -ForegroundColor White
+        Write-Host "$([math]::Round($bestMixedPair.AverageScore, 2))" -ForegroundColor Cyan
+    } else {
+        Write-ColoredMessage "    Cannot create mixed pair (need both Egyptian and Global DNS)" -Color Red
+    }
+    
+    # Option 4: Best Overall
+    Write-ColoredMessage "`n[4] Best Overall Performance (Any Category):" -Color Yellow
+    if ($bestOverallPair) {
+        Write-Host "    Primary:   " -NoNewline -ForegroundColor White
+        Write-Host "$($bestOverallPair.Primary.IP)" -NoNewline -ForegroundColor Cyan
+        Write-Host " (" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestOverallPair.Primary.Provider)" -NoNewline -ForegroundColor Magenta
+        Write-Host ") - " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestOverallPair.Primary.ResponseTime)" -NoNewline -ForegroundColor Green
+        Write-Host " (Jitter: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestOverallPair.Primary.Jitter)" -NoNewline -ForegroundColor Yellow
+        Write-Host ") [" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestOverallPair.Primary.Category)" -NoNewline -ForegroundColor Blue
+        Write-Host "]" -ForegroundColor DarkGray
+        
+        Write-Host "    Secondary: " -NoNewline -ForegroundColor White
+        Write-Host "$($bestOverallPair.Secondary.IP)" -NoNewline -ForegroundColor Cyan
+        Write-Host " (" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestOverallPair.Secondary.Provider)" -NoNewline -ForegroundColor Magenta
+        Write-Host ") - " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestOverallPair.Secondary.ResponseTime)" -NoNewline -ForegroundColor Green
+        Write-Host " (Jitter: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestOverallPair.Secondary.Jitter)" -NoNewline -ForegroundColor Yellow
+        Write-Host ") [" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestOverallPair.Secondary.Category)" -NoNewline -ForegroundColor Blue
+        Write-Host "]" -ForegroundColor DarkGray
+        
+        Write-ColoredMessage "    ✓ Pro: Absolute best performance in testing" -Color DarkGreen
+        Write-ColoredMessage "    ✗ Con: May prioritize speed over reliability" -Color DarkYellow
+        Write-Host "    Stats: Avg Score: " -NoNewline -ForegroundColor White
+        Write-Host "$([math]::Round($bestOverallPair.AverageScore, 2))" -ForegroundColor Cyan
+    } else {
+        Write-ColoredMessage "    No valid DNS found" -Color Red
+    }
+    
+    # Option 5: Most Reliable
+    Write-ColoredMessage "`n[5] Most Reliable Configuration:" -Color Yellow
+    if ($mostReliablePair) {
+        Write-Host "    Primary:   " -NoNewline -ForegroundColor White
+        Write-Host "$($mostReliablePair.Primary.IP)" -NoNewline -ForegroundColor Cyan
+        Write-Host " (" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($mostReliablePair.Primary.Provider)" -NoNewline -ForegroundColor Magenta
+        Write-Host ") - " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($mostReliablePair.Primary.ResponseTime)" -NoNewline -ForegroundColor Green
+        Write-Host " (Success: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($mostReliablePair.Primary.SuccessRate)%" -NoNewline -ForegroundColor Green
+        Write-Host ") [" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($mostReliablePair.Primary.Category)" -NoNewline -ForegroundColor Blue
+        Write-Host "]" -ForegroundColor DarkGray
+        
+        Write-Host "    Secondary: " -NoNewline -ForegroundColor White
+        Write-Host "$($mostReliablePair.Secondary.IP)" -NoNewline -ForegroundColor Cyan
+        Write-Host " (" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($mostReliablePair.Secondary.Provider)" -NoNewline -ForegroundColor Magenta
+        Write-Host ") - " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($mostReliablePair.Secondary.ResponseTime)" -NoNewline -ForegroundColor Green
+        Write-Host " (Success: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($mostReliablePair.Secondary.SuccessRate)%" -NoNewline -ForegroundColor Green
+        Write-Host ") [" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($mostReliablePair.Secondary.Category)" -NoNewline -ForegroundColor Blue
+        Write-Host "]" -ForegroundColor DarkGray
+        
+        Write-ColoredMessage "    ✓ Pro: Highest success rate, most stable" -Color DarkGreen
+        Write-ColoredMessage "    ✗ Con: May not be the fastest option" -Color DarkYellow
+        Write-Host "    Stats: Avg Success Rate: " -NoNewline -ForegroundColor White
+        Write-Host "$([math]::Round($mostReliablePair.AverageSuccessRate, 2))%" -ForegroundColor Green
+    } else {
+        Write-ColoredMessage "    No valid DNS found" -Color Red
+    }
+    
+    # Option 6: Lowest Latency
+    Write-ColoredMessage "`n[6] Lowest Latency Configuration:" -Color Yellow
+    if ($lowLatencyPair) {
+        Write-Host "    Primary:   " -NoNewline -ForegroundColor White
+        Write-Host "$($lowLatencyPair.Primary.IP)" -NoNewline -ForegroundColor Cyan
+        Write-Host " (" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($lowLatencyPair.Primary.Provider)" -NoNewline -ForegroundColor Magenta
+        Write-Host ") - " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$([math]::Round($lowLatencyPair.Primary.ResponseTime, 2)) ms" -NoNewline -ForegroundColor Green
+        Write-Host " [" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($lowLatencyPair.Primary.Category)" -NoNewline -ForegroundColor Blue
+        Write-Host "]" -ForegroundColor DarkGray
+        
+        Write-Host "    Secondary: " -NoNewline -ForegroundColor White
+        Write-Host "$($lowLatencyPair.Secondary.IP)" -NoNewline -ForegroundColor Cyan
+        Write-Host " (" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($lowLatencyPair.Secondary.Provider)" -NoNewline -ForegroundColor Magenta
+        Write-Host ") - " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$([math]::Round($lowLatencyPair.Secondary.ResponseTime, 2)) ms" -NoNewline -ForegroundColor Green
+        Write-Host " [" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($lowLatencyPair.Secondary.Category)" -NoNewline -ForegroundColor Blue
+        Write-Host "]" -ForegroundColor DarkGray
+        
+        Write-ColoredMessage "    ✓ Pro: Fastest response times" -Color DarkGreen
+        Write-ColoredMessage "    ✗ Con: May sacrifice reliability for speed" -Color DarkYellow
+        Write-Host "    Stats: Avg Latency: " -NoNewline -ForegroundColor White
+        Write-Host "$([math]::Round($lowLatencyPair.AverageLatency, 2)) ms" -ForegroundColor Cyan
+    } else {
+        Write-ColoredMessage "    No valid DNS found" -Color Red
+    }
+    
+    # Option 7: Best Same Provider Pair
+    Write-ColoredMessage "`n[7] Best Same-Provider Configuration (Any):" -Color Yellow
+    if ($bestSameProviderPair) {
+        Write-Host "    Provider:  " -NoNewline -ForegroundColor White
+        Write-Host "$($bestSameProviderPair.ProviderName)" -ForegroundColor Magenta
+        
+        Write-Host "    Primary:   " -NoNewline -ForegroundColor White
+        Write-Host "$($bestSameProviderPair.Primary.IP)" -NoNewline -ForegroundColor Cyan
+        Write-Host " (" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestSameProviderPair.Primary.Provider)" -NoNewline -ForegroundColor Magenta
+        Write-Host ") - " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestSameProviderPair.Primary.ResponseTime)" -NoNewline -ForegroundColor Green
+        Write-Host " (Jitter: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestSameProviderPair.Primary.Jitter)" -NoNewline -ForegroundColor Yellow
+        Write-Host ") [" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestSameProviderPair.Primary.Category)" -NoNewline -ForegroundColor Blue
+        Write-Host "]" -ForegroundColor DarkGray
+        
+        Write-Host "    Secondary: " -NoNewline -ForegroundColor White
+        Write-Host "$($bestSameProviderPair.Secondary.IP)" -NoNewline -ForegroundColor Cyan
+        Write-Host " (" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestSameProviderPair.Secondary.Provider)" -NoNewline -ForegroundColor Magenta
+        Write-Host ") - " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestSameProviderPair.Secondary.ResponseTime)" -NoNewline -ForegroundColor Green
+        Write-Host " (Jitter: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestSameProviderPair.Secondary.Jitter)" -NoNewline -ForegroundColor Yellow
+        Write-Host ") [" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestSameProviderPair.Secondary.Category)" -NoNewline -ForegroundColor Blue
+        Write-Host "]" -ForegroundColor DarkGray
+        
+        Write-ColoredMessage "    ✓ Pro: Unified infrastructure, consistent performance, proper redundancy" -Color DarkGreen
+        Write-ColoredMessage "    ✗ Con: Single provider dependency (no diversity)" -Color DarkYellow
+        Write-Host "    Stats: Avg Score: " -NoNewline -ForegroundColor White
+        Write-Host "$([math]::Round($bestSameProviderPair.AverageScore, 2))" -NoNewline -ForegroundColor Cyan
+        Write-Host " | Avg Latency: " -NoNewline -ForegroundColor White
+        Write-Host "$([math]::Round($bestSameProviderPair.AverageLatency, 2)) ms" -ForegroundColor Cyan
+    } else {
+        Write-ColoredMessage "    No valid same-provider pair found" -Color Red
+    }
+
+    # Option 8: Best Same Provider Pair (Global)
+    Write-ColoredMessage "`n[8] Best Same-Provider Configuration (Global):" -Color Yellow
+    if ($bestSameProviderPairGlobal) {
+        Write-Host "    Provider:  " -NoNewline -ForegroundColor White
+        Write-Host "$($bestSameProviderPairGlobal.ProviderName)" -ForegroundColor Magenta
+        
+        Write-Host "    Primary:   " -NoNewline -ForegroundColor White
+        Write-Host "$($bestSameProviderPairGlobal.Primary.IP)" -NoNewline -ForegroundColor Cyan
+        Write-Host " (" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestSameProviderPairGlobal.Primary.Provider)" -NoNewline -ForegroundColor Magenta
+        Write-Host ") - " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestSameProviderPairGlobal.Primary.ResponseTime)" -NoNewline -ForegroundColor Green
+        Write-Host " (Jitter: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestSameProviderPairGlobal.Primary.Jitter)" -NoNewline -ForegroundColor Yellow
+        Write-Host ") [" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestSameProviderPairGlobal.Primary.Category)" -NoNewline -ForegroundColor Blue
+        Write-Host "]" -ForegroundColor DarkGray
+        
+        Write-Host "    Secondary: " -NoNewline -ForegroundColor White
+        Write-Host "$($bestSameProviderPairGlobal.Secondary.IP)" -NoNewline -ForegroundColor Cyan
+        Write-Host " (" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestSameProviderPairGlobal.Secondary.Provider)" -NoNewline -ForegroundColor Magenta
+        Write-Host ") - " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestSameProviderPairGlobal.Secondary.ResponseTime)" -NoNewline -ForegroundColor Green
+        Write-Host " (Jitter: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestSameProviderPairGlobal.Secondary.Jitter)" -NoNewline -ForegroundColor Yellow
+        Write-Host ") [" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($bestSameProviderPairGlobal.Secondary.Category)" -NoNewline -ForegroundColor Blue
+        Write-Host "]" -ForegroundColor DarkGray
+        
+        Write-ColoredMessage "    ✓ Pro: Unified global infrastructure, consistent performance, proper redundancy" -Color DarkGreen
+        Write-ColoredMessage "    ✗ Con: Single provider dependency (no diversity)" -Color DarkYellow
+        Write-Host "    Stats: Avg Score: " -NoNewline -ForegroundColor White
+        Write-Host "$([math]::Round($bestSameProviderPairGlobal.AverageScore, 2))" -NoNewline -ForegroundColor Cyan
+        Write-Host " | Avg Latency: " -NoNewline -ForegroundColor White
+        Write-Host "$([math]::Round($bestSameProviderPairGlobal.AverageLatency, 2)) ms" -ForegroundColor Cyan
+    } else {
+        Write-ColoredMessage "    No valid same-provider global pair found" -Color Red
     }
 }
+
+# Overall recommendation based on balanced criteria
+Write-ColoredMessage "`n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -Color Cyan
+Write-ColoredMessage "RECOMMENDED CHOICE:" -Color Cyan
+Write-ColoredMessage "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -Color Cyan
+
+# Determine best recommendation
+$recommendations = @()
+if ($bestMixedPair) { 
+    $recommendations += @{Type = "Mixed"; Pair = $bestMixedPair; Score = $bestMixedPair.AverageScore; Priority = 1} 
+}
+if ($bestOverallPair) { 
+    $recommendations += @{Type = "Overall"; Pair = $bestOverallPair; Score = $bestOverallPair.AverageScore; Priority = 2} 
+}
+if ($egyptianStats -and $bestEgyptianPair) {
+    $egyptianScore = ($egyptianStats.Avg * 0.6) + ($egyptianStats.AvgJitter * 0.2)
+    $recommendations += @{Type = "Egyptian"; Pair = $bestEgyptianPair; Score = $egyptianScore; Priority = 3}
+}
+if ($globalStats -and $bestGlobalPair) {
+    $globalScore = ($globalStats.Avg * 0.6) + ($globalStats.AvgJitter * 0.2)
+    $recommendations += @{Type = "Global"; Pair = $bestGlobalPair; Score = $globalScore; Priority = 4}
+}
+
+if ($recommendations.Count -gt 0) {
+    $topRecommendation = $recommendations | Sort-Object Score | Select-Object -First 1
+    
+    Write-Host "`nFor most users, we recommend: [" -NoNewline -ForegroundColor Yellow
+    Write-Host "$($topRecommendation.Type)" -NoNewline -ForegroundColor Green
+    Write-Host "] configuration" -ForegroundColor Yellow
+    Write-Host "This provides the " -NoNewline -ForegroundColor White
+    Write-Host "best balance" -NoNewline -ForegroundColor Cyan
+    Write-Host " of speed, reliability, and redundancy." -ForegroundColor White
+} else {
+    Write-ColoredMessage "`nNo valid recommendations available." -Color Red
+}
+
+# Add IPv6, DNSSEC, and Quality statistics summary
+Write-ColoredMessage "`n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -Color Cyan
+Write-ColoredMessage "ADVANCED FEATURES SUMMARY:" -Color Cyan
+Write-ColoredMessage "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -Color Cyan
+
+if (-not $SkipIPv6Test -or -not $SkipDNSSECTest -or -not $SkipResponseVerification) {
+    $successfulResults = $results | Where-Object { $_.Status -eq "Success" }
+    
+    if (-not $SkipIPv6Test) {
+        $ipv6Supported = ($successfulResults | Where-Object { $_.IPv6 -eq "✓" }).Count
+        $ipv6Total = ($successfulResults | Where-Object { $_.IPv6 -ne "N/A" }).Count
+        if ($ipv6Total -gt 0) {
+            $ipv6Percentage = [math]::Round(($ipv6Supported / $ipv6Total) * 100, 1)
+            Write-Host "`nIPv6 Support: " -NoNewline -ForegroundColor Yellow
+            Write-Host "$ipv6Supported/$ipv6Total DNS servers (" -NoNewline -ForegroundColor White
+            Write-Host "$ipv6Percentage%" -NoNewline -ForegroundColor $(if ($ipv6Percentage -gt 50) { "Green" } else { "Red" })
+            Write-Host ")" -ForegroundColor White
+            
+            # List IPv6-capable DNS
+            $ipv6DNS = $successfulResults | Where-Object { $_.IPv6 -eq "✓" } | Select-Object -Unique Provider, IP | Select-Object -First 5
+            if ($ipv6DNS.Count -gt 0) {
+                Write-ColoredMessage "  IPv6-capable DNS providers:" -Color Cyan
+                foreach ($dns in $ipv6DNS) {
+                    Write-Host "    • " -NoNewline -ForegroundColor DarkGray
+                    Write-Host "$($dns.Provider)" -NoNewline -ForegroundColor Magenta
+                    Write-Host " (" -NoNewline -ForegroundColor DarkGray
+                    Write-Host "$($dns.IP)" -NoNewline -ForegroundColor Cyan
+                    Write-Host ")" -ForegroundColor DarkGray
+                }
+                if ($ipv6Supported -gt 5) {
+                    Write-ColoredMessage "    ... and $($ipv6Supported - 5) more" -Color DarkGray
+                }
+            }
+        }
+    }
+    
+    if (-not $SkipDNSSECTest) {
+        $dnssecSupported = ($successfulResults | Where-Object { $_.DNSSEC -eq "✓" }).Count
+        $dnssecTotal = ($successfulResults | Where-Object { $_.DNSSEC -ne "N/A" }).Count
+        if ($dnssecTotal -gt 0) {
+            $dnssecPercentage = [math]::Round(($dnssecSupported / $dnssecTotal) * 100, 1)
+            Write-ColoredMessage "`nDNSSEC Support: " -Color Yellow -NoNewline
+            Write-ColoredMessage "$dnssecSupported/$dnssecTotal DNS servers ($dnssecPercentage%)" -Color $(if ($dnssecPercentage -gt 50) { "Green" } else { "Gray" })
+            
+            # List DNSSEC-capable DNS
+            $dnssecDNS = $successfulResults | Where-Object { $_.DNSSEC -eq "✓" } | Select-Object -Unique Provider, IP | Select-Object -First 5
+            if ($dnssecDNS.Count -gt 0) {
+                Write-ColoredMessage "  DNSSEC-enabled DNS providers:" -Color Gray
+                foreach ($dns in $dnssecDNS) {
+                    Write-ColoredMessage "    • $($dns.Provider) ($($dns.IP))" -Color Gray
+                }
+                if ($dnssecSupported -gt 5) {
+                    Write-ColoredMessage "    ... and $($dnssecSupported - 5) more" -Color Gray
+                }
+            }
+        }
+    }
+    
+    if (-not $SkipResponseVerification) {
+        $qualityGood = ($successfulResults | Where-Object { $_.Quality -eq "✓" }).Count
+        $qualityTotal = ($successfulResults | Where-Object { $_.Quality -ne "N/A" }).Count
+        if ($qualityTotal -gt 0) {
+            $qualityPercentage = [math]::Round(($qualityGood / $qualityTotal) * 100, 1)
+            Write-ColoredMessage "`nResponse Quality: " -Color Yellow -NoNewline
+            Write-ColoredMessage "$qualityGood/$qualityTotal DNS servers ($qualityPercentage%)" -Color $(if ($qualityPercentage -gt 80) { "Green" } elseif ($qualityPercentage -gt 50) { "Yellow" } else { "Red" })
+            Write-ColoredMessage "  (Checks for complete answers, valid TTL, no hijacking)" -Color Gray
+            
+            # Warn about poor quality DNS
+            $poorQualityDNS = $successfulResults | Where-Object { $_.Quality -eq "✗" } | Select-Object -Unique Provider, IP
+            if ($poorQualityDNS.Count -gt 0) {
+                Write-ColoredMessage "  ⚠ Warning: $($poorQualityDNS.Count) DNS provider(s) have response quality issues" -Color Yellow
+            }
+        }
+    }
+} else {
+    Write-ColoredMessage "`nAdvanced tests disabled. Use -TestIPv6, -TestDNSSEC, or -VerifyResponses to enable." -Color Gray
+}
+
+# Store the best choice for script generation
+if ($recommendations.Count -gt 0) {
+    $script:RecommendedPair = $recommendations[0].Pair
+}
+
 
 # Export results to CSV if specified
 if ($ExportPath) {
@@ -1104,63 +2628,33 @@ if ($ExportPath) {
 }
 
 # Determine overall best DNS pair for configuration
-Write-ColoredMessage "`nCommands to set DNS on your computer:" -Color Cyan
-Write-ColoredMessage "=================================" -Color Cyan
+Write-ColoredMessage "`n`nCommands to set DNS on your computer:" -Color Cyan
+Write-ColoredMessage "======================================" -Color Cyan
 
-# Define record type to use for overall recommendation (default to A records)
-$primaryRecordType = "A"
-
-# Get DNS stats for each category with this record type
-$egyptianStatsForOverall = $categoryStats["Egyptian_${primaryRecordType}"]
-$globalStatsForOverall = $categoryStats["Global_${primaryRecordType}"]
-
-# Get best pairs for this record type
-$bestEgyptianPairForOverall = $bestPairs["Egyptian_${primaryRecordType}"]
-$bestGlobalPairForOverall = $bestPairs["Global_${primaryRecordType}"]
-
-# Get best overall DNS pair
-$validStats = @()
-if ($egyptianStatsForOverall) { 
-    $validStats += @{
-        Name = "Egyptian"
-        Avg = $egyptianStatsForOverall.Avg
-        Jitter = $egyptianStatsForOverall.AvgJitter
-        Pair = $bestEgyptianPairForOverall
-    }
-}
-if ($globalStatsForOverall) { 
-    $validStats += @{
-        Name = "Global"
-        Avg = $globalStatsForOverall.Avg
-        Jitter = $globalStatsForOverall.AvgJitter
-        Pair = $bestGlobalPairForOverall
-    }
-}
-
-# Display recommendations based on available results
-if ($validStats.Count -gt 0) {
-    # Sort by performance (lower average response time is better)
-    $bestOverallStats = $validStats | Sort-Object Avg | Select-Object -First 1
-    $bestOverallPair = $bestOverallStats.Pair
-    $providerType = $bestOverallStats.Name
+# Use the recommended pair from the analysis above
+if ($script:RecommendedPair -and $script:RecommendedPair.Primary -and $script:RecommendedPair.Secondary) {
+    $bestOverallPair = $script:RecommendedPair
     
-    if ($bestOverallPair -and $bestOverallPair.Primary -and $bestOverallPair.Secondary) {
-        Write-ColoredMessage "`nRecommended DNS Configuration ($providerType):" -Color Magenta
-        Write-ColoredMessage "`nWindows PowerShell:" -Color Yellow
-        Write-ColoredMessage "Set-DnsClientServerAddress -InterfaceAlias 'Ethernet*' -ServerAddresses ('$($bestOverallPair.Primary.IP)','$($bestOverallPair.Secondary.IP)')" -Color White
+    Write-ColoredMessage "`nUsing Recommended Configuration:" -Color Magenta
+    Write-ColoredMessage "Primary:   $($bestOverallPair.Primary.IP) ($($bestOverallPair.Primary.Provider))" -Color Green
+    Write-ColoredMessage "Secondary: $($bestOverallPair.Secondary.IP) ($($bestOverallPair.Secondary.Provider))" -Color Green
+    
+    Write-ColoredMessage "`nWindows PowerShell (Run as Administrator):" -Color Yellow
+    Write-ColoredMessage "Set-DnsClientServerAddress -InterfaceAlias 'Ethernet*' -ServerAddresses ('$($bestOverallPair.Primary.IP)','$($bestOverallPair.Secondary.IP)')" -Color White
+    
+    Write-ColoredMessage "`nUbuntu/Debian (Run with sudo):" -Color Yellow
+    Write-ColoredMessage "sudo bash -c 'echo nameserver $($bestOverallPair.Primary.IP) > /etc/resolv.conf'" -Color White
+    Write-ColoredMessage "sudo bash -c 'echo nameserver $($bestOverallPair.Secondary.IP) >> /etc/resolv.conf'" -Color White
+    
+    Write-ColoredMessage "`nMacOS:" -Color Yellow
+    Write-ColoredMessage "networksetup -setdnsservers Wi-Fi $($bestOverallPair.Primary.IP) $($bestOverallPair.Secondary.IP)" -Color White
+    
+    # Generate configuration scripts if requested
+    if ($GenerateScripts) {
+        Write-ColoredMessage "`nGenerating DNS configuration scripts..." -Color Cyan
         
-        Write-ColoredMessage "`nUbuntu/Debian:" -Color Yellow
-        Write-ColoredMessage "sudo bash -c 'echo nameserver $($bestOverallPair.Primary.IP) > /etc/resolv.conf'" -Color White
-        Write-ColoredMessage "sudo bash -c 'echo nameserver $($bestOverallPair.Secondary.IP) >> /etc/resolv.conf'" -Color White
-          Write-ColoredMessage "`nMacOS:" -Color Yellow
-        Write-ColoredMessage "networksetup -setdnsservers Wi-Fi $($bestOverallPair.Primary.IP) $($bestOverallPair.Secondary.IP)" -Color White
-        
-        # Generate configuration scripts if requested
-        if ($GenerateScripts) {
-            Write-ColoredMessage "`nGenerating DNS configuration scripts..." -Color Cyan
-            
-            # Windows script
-            $windowsScript = @"
+        # Windows script
+        $windowsScript = @"
 # Windows DNS Configuration Script
 # Run as Administrator
 
@@ -1236,10 +2730,8 @@ echo "DNS configuration updated and cache flushed"
                 Write-ColoredMessage "Error generating scripts: $_" -Color Red
             }
         }
-    } else {
-        Write-ColoredMessage "`nCould not determine a valid DNS configuration from test results." -Color Red
-    }
-} else {    Write-ColoredMessage "`nNo valid DNS configuration found. All tested DNS servers failed or timed out." -Color Red
+} else {
+    Write-ColoredMessage "`nNo valid DNS configuration found. All tested DNS servers failed or timed out." -Color Red
     Write-ColoredMessage "Try increasing the timeout parameter or checking your network connection." -Color Yellow
 }
 
@@ -1279,6 +2771,45 @@ if ($global:RemovedDnsProviders.Count -gt 0) {
     } | Out-Host
     
     Write-ColoredMessage "Total removed: $($global:RemovedDnsProviders.Count) DNS provider(s)" -Color Yellow
+}
+
+# Save persistent tracking history
+if (-not $DisablePersistentTracking) {
+    Save-PersistentTracking -History $global:PersistentHistory
+    
+    # Show summary of newly failed DNS servers
+    $newlyFailed = @()
+    $approachingBlacklist = @()
+    
+    foreach ($dns in $global:PersistentHistory.Keys) {
+        $record = $global:PersistentHistory[$dns]
+        if ($record.FailureCount -gt 0 -and -not $record.Blacklisted) {
+            $approachingBlacklist += [PSCustomObject]@{
+                IP = $dns
+                Failures = $record.FailureCount
+                Remaining = $PersistentFailureThreshold - $record.FailureCount
+            }
+        }
+        if ($record.Blacklisted) {
+            $newlyFailed += $dns
+        }
+    }
+    
+    if ($approachingBlacklist.Count -gt 0) {
+        Write-ColoredMessage "`nDNS servers with recorded failures (will be blacklisted after $PersistentFailureThreshold total failures):" -Color Yellow
+        $approachingBlacklist | Sort-Object -Property Failures -Descending | ForEach-Object {
+            Write-ColoredMessage "  $($_.IP) - Failed $($_.Failures) time(s), $($_.Remaining) more failure(s) until blacklist" -Color Yellow
+        }
+    }
+    
+    if ($newlyFailed.Count -gt 0) {
+        Write-ColoredMessage "`nDNS servers blacklisted (will be excluded from future tests):" -Color Red
+        $newlyFailed | ForEach-Object {
+            Write-ColoredMessage "  $_" -Color Red
+        }
+    }
+    
+    Write-ColoredMessage "`nPersistent tracking history saved. Use -ShowTrackingStats to view full statistics." -Color Green
 }
 
 Write-ColoredMessage "`nDNS Performance Test completed." -Color Cyan
