@@ -64,6 +64,9 @@ param(
     [Parameter(HelpMessage="Quick test mode: Reduce test count for faster results")]
     [switch]$QuickTest,
     
+    [Parameter(HelpMessage="Disable early exit in QuickTest - test all available DNS providers")]
+    [switch]$NoEarlyExit,
+    
     [Parameter(HelpMessage="Disable persistent failure tracking across script runs")]
     [switch]$DisablePersistentTracking,
     
@@ -96,21 +99,29 @@ if (-not (Get-Command "Resolve-DnsName" -ErrorAction SilentlyContinue)) {
 # Apply quick test mode settings
 # Apply quick test mode settings
 if ($QuickTest) {
-    $TestCount = [math]::Max(1, [math]::Floor($TestCount / 2))
+    # Aggressive QuickTest optimizations for maximum speed
+    $TestCount = 1  # Single test per DNS (fastest)
+    $Timeout = 1    # 1 second timeout (aggressive but effective)
     $AggressiveMode = $true
     $DisableFailureRemoval = $false
     
-    # QuickTest optimizations:
-    # 1. Reduce timeout for faster failure detection (but not too short)
-    if ($Timeout -gt 2) {
-        $Timeout = 2
-    }
+    # Skip expensive additional tests in QuickTest
+    $SkipIPv6Test = $true
+    $SkipDNSSECTest = $true
+    $SkipResponseVerification = $true
     
-    # 2. Skip parallel mode overhead in quick tests (sequential is faster for quick tests)
+    # Disable parallel mode (sequential is faster for quick tests)
     $Parallel = $false
     
-    # 3. Focus on previously successful DNS servers first (if history exists)
+    # Disable multi-record and multi-domain tests
+    $MultiRecordTest = $false
+    $MultiDomainTest = $false
+    $AlternateDomains = $false
+    
+    # Focus on previously successful DNS servers first
     $script:QuickTestMode = $true
+    
+    Write-Verbose "QuickTest: Optimized for speed - 1 test per DNS, 1s timeout, skipping advanced tests"
 }
 
 # Global variables for failure tracking
@@ -118,6 +129,17 @@ $global:DnsFailureTracker = @{}
 $global:DnsSuccessTracker = @{}
 $global:RemovedDnsProviders = @()
 $global:PersistentTrackingFile = Join-Path $PSScriptRoot "dns-failure-history.json"
+
+# Import ML Scorer Module
+try {
+    . (Join-Path $PSScriptRoot "DNS-ML-Scorer.ps1")
+    $global:MLEnabled = $true
+    $global:MLData = Initialize-MLData
+} catch {
+    Write-Warning "ML Scorer module not available. Running without ML optimization: $_"
+    $global:MLEnabled = $false
+    $global:MLData = $null
+}
 
 # Persistent DNS Failure Tracking Functions
 # ==========================================
@@ -882,6 +904,13 @@ function Test-DNS {
 
     Write-ColoredMessage "Passed" -Color Green
     
+    # Count the initial reliability test as a success
+    Update-DnsTracker -DnsIP $dnsIP -ProviderName $providerName -Success $true
+    
+    # Initialize successCount to 1 since the reliability test passed
+    # This ensures DNS that pass reliability but fail some performance tests aren't marked as complete failures
+    $successCount = 1
+    
     # If initial test passed, proceed with performance testing
     for ($i = 1; $i -le $TestCount; $i++) {
         try {
@@ -935,8 +964,12 @@ function Test-DNS {
         Write-Progress -Activity "Testing DNS Server $dnsIP" -Completed
     }
     
-    if ($successCount -eq 0) {
-        return @{Status = "Error"; ResponseTime = 0; Jitter = 0; RecordType = $recordType; Domain = $domain}
+    # If NO performance tests succeeded (but reliability passed), we still have 1 success from reliability test
+    # Return success with 0 response time but non-zero success rate to show reliability passed
+    if ($responseTimes.Count -eq 0) {
+        $totalTests = $TestCount + 1
+        $successRate = ($successCount / $totalTests) * 100
+        return @{Status = "Success"; ResponseTime = 0; Jitter = 0; RecordType = $recordType; Domain = $domain; SuccessRate = $successRate; ActualTimeout = $currentTimeout; IPv6Support = $null; DNSSECSupport = $null; ResponseQuality = $null}
     }
     
     # Calculate metrics
@@ -948,12 +981,17 @@ function Test-DNS {
         0
     }
     
+    # Calculate success rate: total successful tests (reliability + performance) / total tests run
+    # We ran 1 reliability test + $TestCount performance tests = ($TestCount + 1) total
+    $totalTests = $TestCount + 1
+    $successRate = ($successCount / $totalTests) * 100
+    
     return @{
         Status = "Success"
         ResponseTime = [math]::Round($averageTime, 2)
         Jitter = $jitter
         RecordType = $recordType
-        SuccessRate = ($successCount / $TestCount) * 100
+        SuccessRate = $successRate
         ActualTimeout = $currentTimeout
         Domain = $domain
         IPv6Support = $null
@@ -992,10 +1030,18 @@ if ($ShowTrackingStats) {
 
 # Clear screen and show header
 Clear-Host
+
+# Start timing
+$global:TestStartTime = Get-Date
+
 Write-ColoredMessage "DNS Performance Test" -Color Cyan
 Write-ColoredMessage "===================" -Color Cyan
 if ($QuickTest) {
-    Write-ColoredMessage "Quick test mode: Reduced test count, enabled aggressive failure removal" -Color Yellow
+    if ($NoEarlyExit) {
+        Write-ColoredMessage "Quick test mode: Testing ALL DNS providers (early exit disabled)" -Color Yellow
+    } else {
+        Write-ColoredMessage "Quick test mode: Reduced test count, enabled aggressive failure removal" -Color Yellow
+    }
 }
 Write-ColoredMessage "Testing DNS servers response time for: " -Color Yellow -NoNewline
 Write-ColoredMessage ($testDomains -join ', ') -Color Green
@@ -1022,7 +1068,7 @@ if ($AdaptiveTimeout) {
 if (-not $DisableFailureRemoval -or $AggressiveMode) {
     Write-ColoredMessage "Failure removal enabled: Max failure rate = $([math]::Round($MaxFailureRate * 100, 1))%, Threshold = $FailureThreshold consecutive failures" -Color Yellow
     if ($AggressiveMode) {
-        Write-ColoredMessage "Aggressive mode: DNS servers will be removed immediately after first failure" -Color Yellow
+        Write-ColoredMessage "Aggressive mode: DNS servers will be removed after 2+ consecutive failures" -Color Yellow
     }
 }
 Write-ColoredMessage "===================" -Color Cyan
@@ -1031,6 +1077,12 @@ Write-ColoredMessage "===================" -Color Cyan
 if (-not (Test-NetworkConnectivity)) {
     exit 1
 }
+
+# Reset in-memory failure trackers for this test run
+# (Persistent tracking in JSON file is maintained separately)
+$global:DnsFailureTracker = @{}
+$global:DnsSuccessTracker = @{}
+$global:RemovedDnsProviders = @()
 
 # Filter DNS providers by category
 $filteredDnsProviders = if ($Category -eq "All") {
@@ -1068,8 +1120,26 @@ if ($filteredDnsProviders.Count -eq 0) {
     exit 1
 }
 
-# QuickTest optimization: Sort DNS providers by historical success
-if ($QuickTest -and -not $DisablePersistentTracking -and $global:PersistentHistory.Keys.Count -gt 0) {
+# ML-based prioritization: Test best-performing DNS servers first
+if ($global:MLEnabled -and $global:MLData.Servers.Count -gt 0) {
+    Write-ColoredMessage "ML Optimization: Prioritizing top-performing DNS servers from $($global:MLData.TotalRuns) historical runs..." -Color Cyan
+    
+    $filteredDnsProviders = Get-PrioritizedServers -AllServers $filteredDnsProviders -MLData $global:MLData
+    
+    if ($QuickTest) {
+        $exitStatus = if ($NoEarlyExit) { "early exit DISABLED" } else { "early exit enabled" }
+        Write-ColoredMessage "QuickTest: Testing all $($filteredDnsProviders.Count) DNS providers (ML-prioritized, $exitStatus)" -Color Yellow
+    }
+    
+    # Show ML recommendation if available
+    $mlRecommendation = Get-MLRecommendedPair -MLData $global:MLData -PreferredType "Best Overall"
+    if ($mlRecommendation) {
+        Write-ColoredMessage "ML Recommended Pair: $($mlRecommendation.PrimaryProvider) ($($mlRecommendation.PrimaryIP)) + $($mlRecommendation.SecondaryProvider) ($($mlRecommendation.SecondaryIP))" -Color Green
+        Write-ColoredMessage "  Based on $($mlRecommendation.TestCount) tests, Avg Score: $([Math]::Round($mlRecommendation.AverageScore, 2))" -Color Green
+    }
+}
+# QuickTest optimization: Sort DNS providers by historical success (fallback if ML not available)
+elseif ($QuickTest -and -not $DisablePersistentTracking -and $global:PersistentHistory.Keys.Count -gt 0) {
     Write-ColoredMessage "QuickTest: Prioritizing historically reliable DNS servers..." -Color Cyan
     
     $filteredDnsProviders = $filteredDnsProviders | Sort-Object {
@@ -1087,6 +1157,24 @@ if ($QuickTest -and -not $DisablePersistentTracking -and $global:PersistentHisto
         # Unknown DNS servers get tested last
         return 0
     }
+    
+    $exitStatus = if ($NoEarlyExit) { "early exit DISABLED" } else { "early exit enabled" }
+    Write-ColoredMessage "QuickTest: Testing all $($filteredDnsProviders.Count) DNS providers (history-prioritized, $exitStatus)" -Color Yellow
+}
+# Pure QuickTest mode without history - prioritize known fast providers but test all
+elseif ($QuickTest) {
+    Write-ColoredMessage "QuickTest: Prioritizing major fast DNS providers (no history available)" -Color Yellow
+    # Prioritize known fast providers: Cloudflare, Google, Quad9, OpenDNS
+    $fastProviders = @('1.1.1.1', '1.0.0.1', '8.8.8.8', '8.8.4.4', '9.9.9.9', '149.112.112.112', 
+                       '208.67.222.222', '208.67.220.220', '94.140.14.14', '94.140.15.15',
+                       '163.121.128.135', '163.121.128.134')  # Include Egyptian DNS
+    
+    $prioritized = $filteredDnsProviders | Where-Object { $fastProviders -contains $_.IP }
+    $others = $filteredDnsProviders | Where-Object { $fastProviders -notcontains $_.IP }
+    
+    $filteredDnsProviders = $prioritized + $others
+    $exitStatus = if ($NoEarlyExit) { "early exit DISABLED" } else { "early exit enabled" }
+    Write-ColoredMessage "QuickTest: Testing all $($filteredDnsProviders.Count) DNS providers (fast providers first, $exitStatus)" -Color Yellow
 }
 
 # Create results array
@@ -1337,6 +1425,20 @@ if (-not $Parallel) {
                     Update-PersistentTracking -History $global:PersistentHistory -DnsIP $dns.IP -Failed $failed
                 }
                 
+                # Update ML training data
+                if ($global:MLEnabled -and $result.Status -eq "Success") {
+                    Update-ServerMLData -MLData $global:MLData `
+                        -IP $dns.IP `
+                        -Provider $dns.Name `
+                        -ResponseTime $result.ResponseTime `
+                        -SuccessRate $result.SuccessRate `
+                        -Jitter $result.Jitter `
+                        -Category $dns.Category `
+                        -IPv6Support ($result.IPv6Support -eq $true) `
+                        -DNSSECSupport ($result.DNSSECSupport -eq $true) `
+                        -QualityCheck ($result.ResponseQuality -eq $true)
+                }
+                
                 $results += [PSCustomObject]@{
                     Provider = $dns.Name
                     IP = $dns.IP
@@ -1354,22 +1456,28 @@ if (-not $Parallel) {
             }
         }
         
-        # QuickTest early exit: Stop if we have enough good DNS servers
-        if ($QuickTest) {
+        # QuickTest early exit: Stop if we have enough good DNS servers (unless disabled)
+        if ($QuickTest -and -not $NoEarlyExit) {
             $successfulResults = $results | Where-Object { $_.Status -eq "Success" }
             $successfulByCategory = $successfulResults | Group-Object -Property Category
             
-            # Check if we have enough successful DNS per category
+            # Aggressive early exit thresholds for QuickTest
+            # We only need a few good servers to make a recommendation
             $egyptianCount = ($successfulByCategory | Where-Object { $_.Name -eq "Egyptian" })
             $globalCount = ($successfulByCategory | Where-Object { $_.Name -eq "Global" })
+            $controlDCount = ($successfulByCategory | Where-Object { $_.Name -eq "ControlD" })
             
-            $hasEnoughEgyptian = if ($egyptianCount) { $egyptianCount.Count -ge 4 } else { $false }
-            $hasEnoughGlobal = if ($globalCount) { $globalCount.Count -ge 10 } else { $false }
-            $hasEnoughControlD = ($successfulResults | Where-Object { $_.Category -eq "ControlD" }).Count -ge 2
+            $hasEnoughEgyptian = if ($egyptianCount) { $egyptianCount.Count -ge 2 } else { $false }
+            $hasEnoughGlobal = if ($globalCount) { $globalCount.Count -ge 5 } else { $false }
+            $hasEnoughControlD = if ($controlDCount) { $controlDCount.Count -ge 1 } else { $false }
             
-            # If we have enough from each category, stop testing
-            if ($hasEnoughEgyptian -and $hasEnoughGlobal -and $hasEnoughControlD) {
-                Write-ColoredMessage "`nQuickTest: Found sufficient reliable DNS servers, stopping early..." -Color Cyan
+            # Exit early if we have minimum viable results
+            # OR if we have at least 10 successful DNS servers total
+            $totalSuccessful = $successfulResults.Count
+            
+            if (($hasEnoughEgyptian -and $hasEnoughGlobal -and $hasEnoughControlD) -or ($totalSuccessful -ge 10)) {
+                Write-ColoredMessage "`nQuickTest: Found $totalSuccessful successful DNS servers, stopping early..." -Color Cyan
+                Write-ColoredMessage "  (Use -NoEarlyExit to test all available DNS providers)" -Color DarkGray
                 break
             }
         }
@@ -1380,7 +1488,9 @@ if (-not $Parallel) {
             
             if ($AggressiveMode) {
                 $key = "$($dns.IP)|$($dns.Name)"
-                if ($global:DnsFailureTracker.ContainsKey($key) -and $global:DnsFailureTracker[$key] -gt 0 -and $global:DnsSuccessTracker[$key] -eq 0) {
+                # In aggressive mode, require at least 2 failures before removal (not just 1)
+                # This prevents false positives from single network hiccups
+                if ($global:DnsFailureTracker.ContainsKey($key) -and $global:DnsFailureTracker[$key] -ge 2 -and $global:DnsSuccessTracker[$key] -eq 0) {
                     $shouldRemoveThis = $true
                 }
             }
@@ -1445,7 +1555,9 @@ function Remove-CompletelyFailedDNS {
     foreach ($group in $dnsGroups) {
         $providerResults = $group.Group
         $totalTests = $providerResults.Count
-        $failedTests = ($providerResults | Where-Object { $_.Status -eq "Error" -or $_.SuccessRate -eq 0 -or $_.ResponseTime -eq "Timeout" }).Count
+        # Only count as failed if SuccessRate is exactly 0 (never passed any test including reliability)
+        # DNS that passed reliability test will have SuccessRate > 0 even if performance tests failed
+        $failedTests = ($providerResults | Where-Object { $_.SuccessRate -eq 0 }).Count
         
         # Calculate failure rate
         $failureRate = if ($totalTests -gt 0) { ($failedTests / $totalTests) * 100 } else { 100 }
@@ -1500,6 +1612,14 @@ $removedCount = $originalCount - $filteredResults.Count
 if ($removedCount -gt 0) {
     Write-ColoredMessage "Filtered out $removedCount results from DNS providers that failed all tests." -Color Yellow
     $results = $filteredResults
+}
+
+# Also filter out DNS that only passed reliability test but failed all performance tests
+# These show 0ms response time and aren't usable for actual queries
+$performanceFailedCount = ($results | Where-Object { $_.ResponseTime -eq "0 ms" -or $_.ResponseTime -eq 0 }).Count
+if ($performanceFailedCount -gt 0) {
+    Write-ColoredMessage "Filtering out $performanceFailedCount DNS provider(s) that passed reliability but failed all performance tests..." -Color Yellow
+    $results = $results | Where-Object { $_.ResponseTime -ne "0 ms" -and $_.ResponseTime -ne 0 }
 }
 
 # Check if we have any valid results after filtering
@@ -2812,4 +2932,75 @@ if (-not $DisablePersistentTracking) {
     Write-ColoredMessage "`nPersistent tracking history saved. Use -ShowTrackingStats to view full statistics." -Color Green
 }
 
-Write-ColoredMessage "`nDNS Performance Test completed." -Color Cyan
+# Save ML training data and track best pairs
+if ($global:MLEnabled) {
+    # Track the best DNS pairs discovered in this run
+    if ($bestOverallPair -and $bestOverallPair.Primary -and $bestOverallPair.Secondary) {
+        $primaryRT = [double]($bestOverallPair.Primary.ResponseTime -replace ' ms$', '')
+        $secondaryRT = [double]($bestOverallPair.Secondary.ResponseTime -replace ' ms$', '')
+        $combinedScore = ($primaryRT + $secondaryRT) / 2
+        
+        Update-PairMLData -MLData $global:MLData `
+            -PrimaryIP $bestOverallPair.Primary.IP `
+            -SecondaryIP $bestOverallPair.Secondary.IP `
+            -PrimaryProvider $bestOverallPair.Primary.Provider `
+            -SecondaryProvider $bestOverallPair.Secondary.Provider `
+            -CombinedScore $combinedScore `
+            -ConfigType "Best Overall"
+    }
+    
+    if ($bestSameProviderPairGlobal -and $bestSameProviderPairGlobal.Primary -and $bestSameProviderPairGlobal.Secondary) {
+        $primaryRT = [double]($bestSameProviderPairGlobal.Primary.ResponseTime -replace ' ms$', '')
+        $secondaryRT = [double]($bestSameProviderPairGlobal.Secondary.ResponseTime -replace ' ms$', '')
+        $combinedScore = ($primaryRT + $secondaryRT) / 2
+        
+        Update-PairMLData -MLData $global:MLData `
+            -PrimaryIP $bestSameProviderPairGlobal.Primary.IP `
+            -SecondaryIP $bestSameProviderPairGlobal.Secondary.IP `
+            -PrimaryProvider $bestSameProviderPairGlobal.Primary.Provider `
+            -SecondaryProvider $bestSameProviderPairGlobal.Secondary.Provider `
+            -CombinedScore $combinedScore `
+            -ConfigType "Same Provider Global"
+    }
+    
+    if ($bestMixedPair -and $bestMixedPair.Primary -and $bestMixedPair.Secondary) {
+        $primaryRT = [double]($bestMixedPair.Primary.ResponseTime -replace ' ms$', '')
+        $secondaryRT = [double]($bestMixedPair.Secondary.ResponseTime -replace ' ms$', '')
+        $combinedScore = ($primaryRT + $secondaryRT) / 2
+        
+        Update-PairMLData -MLData $global:MLData `
+            -PrimaryIP $bestMixedPair.Primary.IP `
+            -SecondaryIP $bestMixedPair.Secondary.IP `
+            -PrimaryProvider $bestMixedPair.Primary.Provider `
+            -SecondaryProvider $bestMixedPair.Secondary.Provider `
+            -CombinedScore $combinedScore `
+            -ConfigType "Mixed"
+    }
+    
+    # Increment total runs
+    $global:MLData.TotalRuns++
+    
+    # Save ML data
+    if (Save-MLData -Data $global:MLData) {
+        Write-ColoredMessage "`nML training data saved. Total runs: $($global:MLData.TotalRuns)" -Color Green
+        
+        # Export ML recommendations report
+        $mlReportPath = Join-Path $PSScriptRoot "dns-ml-recommendations.txt"
+        Export-MLRecommendations -MLData $global:MLData -OutputPath $mlReportPath
+    }
+}
+
+# Calculate and display test duration
+$global:TestEndTime = Get-Date
+$testDuration = $global:TestEndTime - $global:TestStartTime
+$durationSeconds = [Math]::Round($testDuration.TotalSeconds, 1)
+$durationFormatted = if ($testDuration.TotalMinutes -ge 1) {
+    "$([Math]::Floor($testDuration.TotalMinutes)) min $([Math]::Round($testDuration.Seconds, 0)) sec"
+} else {
+    "$durationSeconds sec"
+}
+
+Write-ColoredMessage "`n========================================" -Color Green
+Write-ColoredMessage "DNS Performance Test completed." -Color Cyan
+Write-ColoredMessage "Total Test Duration: $durationFormatted ($durationSeconds seconds)" -Color Green
+Write-ColoredMessage "========================================" -Color Green
