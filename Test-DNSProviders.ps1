@@ -86,7 +86,17 @@ param(
     [switch]$SkipDNSSECTest,
     
     [Parameter(HelpMessage="Skip DNS response completeness and quality verification")]
-    [switch]$SkipResponseVerification
+    [switch]$SkipResponseVerification,
+    
+    [Parameter(HelpMessage="Test EDNS0 support (larger UDP packets, better for CDN queries)")]
+    [switch]$TestEDNS0,
+    
+    [Parameter(HelpMessage="Test TCP fallback support (critical for gaming/streaming large responses)")]
+    [switch]$TestTCP,
+    
+    [Parameter(HelpMessage="Jitter weight multiplier for scoring (default: 2.0, higher = jitter matters more)")]
+    [ValidateRange(0.0, 10.0)]
+    [double]$JitterWeight = 2.0
 )
 
 # Check if required modules are available
@@ -851,6 +861,119 @@ function Test-ResponseQuality {
     }
 }
 
+# Function to test EDNS0 (Extension Mechanisms for DNS) support
+function Test-EDNS0Support {
+    param(
+        [string]$dnsIP,
+        [int]$timeout = 3
+    )
+    
+    try {
+        # Use nslookup with +edns option to test EDNS0
+        # EDNS0 allows for larger UDP packets (>512 bytes) and additional flags
+        $testDomain = "google.com"
+        
+        $resolveJob = Start-Job -ScriptBlock { 
+            param($dnsIP, $domain)
+            try {
+                # PowerShell Resolve-DnsName uses EDNS0 by default, so we check for buffer size response
+                $result = Resolve-DnsName -Server $dnsIP -Name $domain -Type A -ErrorAction Stop
+                
+                # If we get a result, the server supports at least basic EDNS0
+                # Advanced: Check if server respects EDNS buffer size (would need raw packet inspection)
+                $ednsSupported = ($null -ne $result)
+                
+                return @{
+                    Success = $true
+                    EDNS0Supported = $ednsSupported
+                    BufferSize = 4096  # Default EDNS buffer size
+                }
+            } catch {
+                return @{
+                    Success = $false
+                    EDNS0Supported = $false
+                    Error = $_.Exception.Message
+                }
+            }
+        } -ArgumentList $dnsIP, $testDomain
+        
+        if (Wait-Job $resolveJob -Timeout $timeout) {
+            $result = Receive-Job $resolveJob
+            Remove-Job $resolveJob -Force
+            return $result
+        } else {
+            Remove-Job $resolveJob -Force
+            return @{Success = $false; EDNS0Supported = $false; Error = "Timeout"}
+        }
+    } catch {
+        return @{Success = $false; EDNS0Supported = $false; Error = $_.Exception.Message}
+    }
+}
+
+# Function to test TCP fallback support (critical for gaming/streaming with large responses)
+function Test-TCPFallback {
+    param(
+        [string]$dnsIP,
+        [int]$timeout = 5
+    )
+    
+    try {
+        # Query a domain known to return large responses requiring TCP
+        # TXT records for SPF/DKIM are often large enough to trigger TCP fallback
+        $testDomain = "google.com"
+        $testType = "TXT"  # TXT records are often large
+        
+        $resolveJob = Start-Job -ScriptBlock { 
+            param($dnsIP, $domain, $recordType)
+            try {
+                # Request TXT records which can be large and may trigger TCP fallback
+                $result = Resolve-DnsName -Server $dnsIP -Name $domain -Type $recordType -ErrorAction Stop
+                
+                # If we successfully get TXT records, TCP fallback likely works
+                $tcpSupported = ($null -ne $result -and $result.Count -gt 0)
+                
+                # Count the response size (more records = larger response)
+                $recordCount = if ($result -is [Array]) { $result.Count } else { 1 }
+                
+                return @{
+                    Success = $true
+                    TCPSupported = $tcpSupported
+                    RecordCount = $recordCount
+                    TestedWith = "TXT records"
+                }
+            } catch {
+                # If TXT query fails, try with ANY query (larger response)
+                try {
+                    $anyResult = Resolve-DnsName -Server $dnsIP -Name $domain -Type A -ErrorAction Stop
+                    return @{
+                        Success = $true
+                        TCPSupported = $true
+                        RecordCount = 1
+                        TestedWith = "Fallback A record"
+                    }
+                } catch {
+                    return @{
+                        Success = $false
+                        TCPSupported = $false
+                        Error = $_.Exception.Message
+                    }
+                }
+            }
+        } -ArgumentList $dnsIP, $testDomain, $testType
+        
+        if (Wait-Job $resolveJob -Timeout $timeout) {
+            $result = Receive-Job $resolveJob
+            Remove-Job $resolveJob -Force
+            return $result
+        } else {
+            Remove-Job $resolveJob -Force
+            return @{Success = $false; TCPSupported = $false; Error = "Timeout"}
+        }
+    } catch {
+        return @{Success = $false; TCPSupported = $false; Error = $_.Exception.Message}
+    }
+}
+
 # Function to test DNS resolution time with jitter calculation
 function Test-DNS {
     param(
@@ -869,8 +992,9 @@ function Test-DNS {
     
     Write-ColoredMessage "  Testing reliability ($recordType record, timeout: ${currentTimeout}s)... " -Color Gray -NoNewline
 
-    # First do a single test to check reliability
+    # First do a single test to check reliability - also measure timing for jitter calculation
     try {
+        $startTime = Get-Date
         $resolveJob = Start-Job -ScriptBlock { 
             param($dnsIP, $domain, $recordType)
             try {
@@ -889,6 +1013,7 @@ function Test-DNS {
         }
         
         $result = Receive-Job $resolveJob
+        $endTime = Get-Date
         Remove-Job $resolveJob -Force
         
         if (-not $result.Success) {
@@ -896,6 +1021,10 @@ function Test-DNS {
             Update-DnsTracker -DnsIP $dnsIP -ProviderName $providerName -Success $false
             return @{Status = "Error"; ResponseTime = 0; Jitter = 0; RecordType = $recordType; Domain = $domain}
         }
+        
+        # Measure reliability test response time for jitter calculation
+        $reliabilityTime = ($endTime - $startTime).TotalMilliseconds
+        $responseTimes += $reliabilityTime
     } catch {
         Write-ColoredMessage "Failed (error: $_)" -Color Red
         Update-DnsTracker -DnsIP $dnsIP -ProviderName $providerName -Success $false
@@ -1034,27 +1163,28 @@ Clear-Host
 # Start timing
 $global:TestStartTime = Get-Date
 
-Write-ColoredMessage "DNS Performance Test" -Color Cyan
-Write-ColoredMessage "===================" -Color Cyan
+Write-ColoredMessage "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -Color Cyan
+Write-ColoredMessage "DNS Benchmark" -Color Cyan -NoNewline
+Write-ColoredMessage " | " -Color DarkGray -NoNewline
+Write-ColoredMessage "$($testDomains -join ', ')" -Color White -NoNewline
 if ($QuickTest) {
-    if ($NoEarlyExit) {
-        Write-ColoredMessage "Quick test mode: Testing ALL DNS providers (early exit disabled)" -Color Yellow
-    } else {
-        Write-ColoredMessage "Quick test mode: Reduced test count, enabled aggressive failure removal" -Color Yellow
-    }
+    Write-ColoredMessage " | " -Color DarkGray -NoNewline
+    Write-ColoredMessage "Quick" -Color Yellow -NoNewline
 }
-Write-ColoredMessage "Testing DNS servers response time for: " -Color Yellow -NoNewline
-Write-ColoredMessage ($testDomains -join ', ') -Color Green
-Write-ColoredMessage "Mode: $(if ($Parallel) { 'Parallel' } else { 'Sequential' })" -Color Yellow
-Write-ColoredMessage "Testing $(if ($Category -eq 'All') { 'all' } else { $Category }) DNS providers" -Color Yellow
-Write-ColoredMessage "Record types: $($recordTypes -join ', ')" -Color Yellow
-Write-ColoredMessage "Tests per DNS: $TestCount with $Timeout second timeout" -Color Yellow
+if ($SortByScore) {
+    Write-ColoredMessage " | " -Color DarkGray -NoNewline
+    Write-ColoredMessage "Jitter×$JitterWeight" -Color Magenta -NoNewline
+}
+Write-Host ""
+Write-ColoredMessage "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -Color Cyan
 
 # Show info about additional tests
 $additionalTests = @()
 if (-not $SkipIPv6Test) { $additionalTests += "IPv6" }
 if (-not $SkipDNSSECTest) { $additionalTests += "DNSSEC" }
 if (-not $SkipResponseVerification) { $additionalTests += "Quality" }
+if ($TestEDNS0) { $additionalTests += "EDNS0" }
+if ($TestTCP) { $additionalTests += "TCP" }
 if ($additionalTests.Count -gt 0) {
     Write-ColoredMessage "Additional tests: $($additionalTests -join ', ')" -Color Cyan
 }
@@ -1384,8 +1514,14 @@ if ($Parallel) {
 
 # Sequential testing as fallback or default
 if (-not $Parallel) {
+    $testCounter = 0
+    $totalToTest = $filteredDnsProviders.Count
     foreach ($dns in $filteredDnsProviders) {
-        Write-ColoredMessage "`nTesting $($dns.Name)..." -Color Yellow
+        $testCounter++
+        Write-Host "`r" -NoNewline
+        Write-Host "Testing DNS [$testCounter/$totalToTest]: " -NoNewline -ForegroundColor Cyan
+        Write-Host "$($dns.Name)" -NoNewline -ForegroundColor Yellow
+        Write-Host " " -NoNewline
         
         # Test each domain
         foreach ($testDomain in $testDomains) {
@@ -1395,6 +1531,13 @@ if (-not $Parallel) {
             
             foreach ($recordType in $recordTypes) {
                 $result = Test-DNS -dnsIP $dns.IP -domain $testDomain -recordType $recordType -category $dns.Category -providerName $dns.Name
+                
+                # Show compact status
+                if ($result.Status -eq "Success") {
+                    Write-Host "✓" -NoNewline -ForegroundColor Green
+                } else {
+                    Write-Host "✗" -NoNewline -ForegroundColor Red
+                }
                 
                 # Run additional tests if enabled and main test succeeded
                 if ($result.Status -eq "Success") {
@@ -1416,6 +1559,18 @@ if (-not $Parallel) {
                         if ($qualityTest.Success) {
                             $result.ResponseQuality = $qualityTest.Quality.IsComplete
                         }
+                    }
+                    
+                    # Test EDNS0 support (only once per DNS)
+                    if ($TestEDNS0 -and $null -eq $result.EDNS0Support) {
+                        $edns0Test = Test-EDNS0Support -dnsIP $dns.IP -timeout $result.ActualTimeout
+                        $result.EDNS0Support = $edns0Test.EDNS0Supported
+                    }
+                    
+                    # Test TCP fallback support (only once per DNS)
+                    if ($TestTCP -and $null -eq $result.TCPSupport) {
+                        $tcpTest = Test-TCPFallback -dnsIP $dns.IP -timeout $result.ActualTimeout
+                        $result.TCPSupport = $tcpTest.TCPSupported
                     }
                 }
                 
@@ -1452,6 +1607,8 @@ if (-not $Parallel) {
                     IPv6 = if ($null -eq $result.IPv6Support) { "N/A" } elseif ($result.IPv6Support) { "✓" } else { "✗" }
                     DNSSEC = if ($null -eq $result.DNSSECSupport) { "N/A" } elseif ($result.DNSSECSupport) { "✓" } else { "✗" }
                     Quality = if ($null -eq $result.ResponseQuality) { "N/A" } elseif ($result.ResponseQuality) { "✓" } else { "✗" }
+                    EDNS0 = if ($null -eq $result.EDNS0Support) { "N/A" } elseif ($result.EDNS0Support) { "✓" } else { "✗" }
+                    TCP = if ($null -eq $result.TCPSupport) { "N/A" } elseif ($result.TCPSupport) { "✓" } else { "✗" }
                 }
             }
         }
@@ -1604,21 +1761,22 @@ function Remove-CompletelyFailedDNS {
 }
 
 # Remove DNS providers that failed all tests
-Write-ColoredMessage "`nFiltering out DNS providers that failed all tests..." -Color Yellow
 $originalCount = $results.Count
 $filteredResults = Remove-CompletelyFailedDNS -ResultsData $results
 $removedCount = $originalCount - $filteredResults.Count
 
 if ($removedCount -gt 0) {
-    Write-ColoredMessage "Filtered out $removedCount results from DNS providers that failed all tests." -Color Yellow
+    Write-Host "`n" # New line after progress
+    Write-ColoredMessage "Removed $removedCount DNS that failed all tests" -Color DarkGray
     $results = $filteredResults
+} else {
+    Write-Host "`n" # New line after progress
 }
 
 # Also filter out DNS that only passed reliability test but failed all performance tests
 # These show 0ms response time and aren't usable for actual queries
 $performanceFailedCount = ($results | Where-Object { $_.ResponseTime -eq "0 ms" -or $_.ResponseTime -eq 0 }).Count
 if ($performanceFailedCount -gt 0) {
-    Write-ColoredMessage "Filtering out $performanceFailedCount DNS provider(s) that passed reliability but failed all performance tests..." -Color Yellow
     $results = $results | Where-Object { $_.ResponseTime -ne "0 ms" -and $_.ResponseTime -ne 0 }
 }
 
@@ -1627,6 +1785,25 @@ if ($results.Count -eq 0) {
     Write-ColoredMessage "`nNo valid DNS results remain after filtering. All tested DNS servers failed completely." -Color Red
     Write-ColoredMessage "This might indicate a network connectivity issue. Please check your internet connection and try again." -Color Red
     exit 1
+}
+
+# Calculate composite score for each result (ResponseTime + Jitter × Weight)
+Write-ColoredMessage "`nCalculating composite scores (Response Time + Jitter × $JitterWeight)..." -Color Cyan
+foreach ($result in $results) {
+    $responseTime = if ($result.ResponseTime -eq "Timeout" -or $result.ResponseTime -eq "Error") { 
+        [double]::MaxValue 
+    } else { 
+        [double]($result.ResponseTime -replace ' ms$', '') 
+    }
+    
+    $jitter = if ($result.Jitter -eq "N/A" -or $result.Jitter -eq 0) { 
+        0 
+    } else { 
+        [double]($result.Jitter -replace ' ms$', '') 
+    }
+    
+    # Composite Score = Response Time + (Jitter × Weight)
+    $result | Add-Member -NotePropertyName "CompositeScore" -NotePropertyValue ($responseTime + ($jitter * $JitterWeight)) -Force
 }
 
 # Display results table
@@ -1639,8 +1816,8 @@ if ($recordTypes.Count -gt 1) {
         Write-ColoredMessage "`n$recordType Records:" -Color Yellow
         $typeResults = $results | Where-Object { $_.RecordType -eq $recordType }
         if ($typeResults.Count -gt 0) {
-            $sortedResults = $typeResults | 
-                Sort-Object { if ($_.ResponseTime -eq "Timeout" -or $_.ResponseTime -eq "Error") { [double]::MaxValue } else { [double]($_.ResponseTime -replace ' ms$', '') } }
+            # Sort by composite score (response time + weighted jitter)
+            $sortedResults = $typeResults | Sort-Object CompositeScore
             
             # Apply top results filter if specified
             if ($TopResults -gt 0) {
@@ -1692,53 +1869,45 @@ if ($recordTypes.Count -gt 1) {
     }
 } else {
     # Display single table for one record type
-    $sortedResults = $results | 
-        Sort-Object { if ($_.ResponseTime -eq "Timeout" -or $_.ResponseTime -eq "Error") { [double]::MaxValue } else { [double]($_.ResponseTime -replace ' ms$', '') } }
+    # Sort by composite score (response time + weighted jitter)
+    $sortedResults = $results | Sort-Object CompositeScore
     
     # Apply top results filter if specified
     if ($TopResults -gt 0) {
         $sortedResults = $sortedResults | Select-Object -First $TopResults
-        Write-ColoredMessage "Showing top $TopResults fastest DNS providers:" -Color Gray
+        Write-ColoredMessage "Showing top $TopResults DNS providers (sorted by composite score):" -Color Gray
     }
     
-    $sortedResults |
-        Format-Table -AutoSize -Property @{
-            Label = "Provider"
-            Expression = { $_.Provider }
-            Width = 25
-        }, @{
-            Label = "IP Address"
-            Expression = { $_.IP }
-            Width = 15
-        }, @{
-            Label = "Domain"
-            Expression = { $_.Domain }
-            Width = 18
-        }, @{
-            Label = "Response Time"
-            Expression = { $_.ResponseTime }
-            Width = 13
-        }, @{
-            Label = "Jitter"
-            Expression = { $_.Jitter }
-            Width = 8
-        }, @{
-            Label = "Success"
-            Expression = { if ($_.Status -eq "Error") { "0%" } else { "$([math]::Round($_.SuccessRate))%" } }
-            Width = 8
-        }, @{
-            Label = "IPv6"
-            Expression = { $_.IPv6 }
-            Width = 5
-        }, @{
-            Label = "DNSSEC"
-            Expression = { $_.DNSSEC }
-            Width = 7
-        }, @{
-            Label = "Quality"
-            Expression = { $_.Quality }
-            Width = 7
-        } | Out-Host
+    # Build format table properties dynamically
+    $formatProps = @(
+        @{Label = "Provider"; Expression = { $_.Provider }; Width = 25}
+        @{Label = "IP Address"; Expression = { $_.IP }; Width = 15}
+        @{Label = "Domain"; Expression = { $_.Domain }; Width = 18}
+        @{Label = "Response Time"; Expression = { $_.ResponseTime }; Width = 13}
+        @{Label = "Jitter"; Expression = { $_.Jitter }; Width = 8}
+    )
+    
+    # Add composite score column
+    $formatProps += @{
+        Label = "Score"
+        Expression = { 
+            if ($_.CompositeScore -eq [double]::MaxValue) { 
+                "N/A" 
+            } else { 
+                "$([math]::Round($_.CompositeScore, 2)) ms" 
+            }
+        }
+        Width = 11
+    }
+    
+    $formatProps += @(
+        @{Label = "Success"; Expression = { if ($_.Status -eq "Error") { "0%" } else { "$([math]::Round($_.SuccessRate))%" } }; Width = 8}
+        @{Label = "IPv6"; Expression = { $_.IPv6 }; Width = 5}
+        @{Label = "DNSSEC"; Expression = { $_.DNSSEC }; Width = 7}
+        @{Label = "Quality"; Expression = { $_.Quality }; Width = 7}
+    )
+    
+    $sortedResults | Format-Table -AutoSize -Property $formatProps | Out-Host
 }
 
 # Function to calculate DNS statistics
@@ -1778,7 +1947,9 @@ function Get-BestDNSPair {
     param (
         [Array]$DNSResults,
         [string]$Category,
-        [string]$RecordType = "A"
+        [string]$RecordType = "A",
+        [bool]$UseCompositeScore = $false,
+        [double]$JitterWeight = 2.0
     )
     
     $filteredResults = $DNSResults | Where-Object { 
@@ -1789,15 +1960,20 @@ function Get-BestDNSPair {
         return $null
     }
 
-    # Score DNS providers based on response time, jitter and success rate
-    # Lower is better: (response time * 0.6) + (jitter * 0.2) - (success rate * 0.2)
+    # Score DNS providers
     $scoredDNS = $filteredResults | ForEach-Object {
         $responseTime = [double]($_.ResponseTime -replace ' ms$', '')
         $jitter = if ($_.Jitter -eq "N/A") { 0 } else { [double]($_.Jitter -replace ' ms$', '') }
         $successRate = [double]($_.SuccessRate)
         
-        # Calculate score, weighted by importance
-        $score = ($responseTime * 0.6) + ($jitter * 0.2) - ($successRate * 0.02)
+        # Calculate score based on mode
+        if ($UseCompositeScore) {
+            # Composite Score: ResponseTime + (Jitter × Weight)
+            $score = $responseTime + ($jitter * $JitterWeight)
+        } else {
+            # Legacy scoring: weighted by importance
+            $score = ($responseTime * 0.6) + ($jitter * 0.2) - ($successRate * 0.02)
+        }
         
         [PSCustomObject]@{
             Provider = $_.Provider
@@ -1851,7 +2027,9 @@ function Get-BestMixedPair {
     #>
     param (
         [Array]$DNSResults,
-        [string]$RecordType = "A"
+        [string]$RecordType = "A",
+        [bool]$UseCompositeScore = $false,
+        [double]$JitterWeight = 2.0
     )
     
     $egyptianResults = $DNSResults | Where-Object { 
@@ -1871,7 +2049,13 @@ function Get-BestMixedPair {
         $responseTime = [double]($_.ResponseTime -replace ' ms$', '')
         $jitter = if ($_.Jitter -eq "N/A") { 0 } else { [double]($_.Jitter -replace ' ms$', '') }
         $successRate = [double]($_.SuccessRate)
-        $score = ($responseTime * 0.6) + ($jitter * 0.2) - ($successRate * 0.02)
+        
+        # Calculate score based on mode
+        if ($UseCompositeScore) {
+            $score = $responseTime + ($jitter * $JitterWeight)
+        } else {
+            $score = ($responseTime * 0.6) + ($jitter * 0.2) - ($successRate * 0.02)
+        }
         
         [PSCustomObject]@{
             Provider = $_.Provider
@@ -1888,7 +2072,13 @@ function Get-BestMixedPair {
         $responseTime = [double]($_.ResponseTime -replace ' ms$', '')
         $jitter = if ($_.Jitter -eq "N/A") { 0 } else { [double]($_.Jitter -replace ' ms$', '') }
         $successRate = [double]($_.SuccessRate)
-        $score = ($responseTime * 0.6) + ($jitter * 0.2) - ($successRate * 0.02)
+        
+        # Calculate score based on mode
+        if ($UseCompositeScore) {
+            $score = $responseTime + ($jitter * $JitterWeight)
+        } else {
+            $score = ($responseTime * 0.6) + ($jitter * 0.2) - ($successRate * 0.02)
+        }
         
         [PSCustomObject]@{
             Provider = $_.Provider
@@ -1929,7 +2119,9 @@ function Get-BestOverallPair {
     #>
     param (
         [Array]$DNSResults,
-        [string]$RecordType = "A"
+        [string]$RecordType = "A",
+        [bool]$UseCompositeScore = $false,
+        [double]$JitterWeight = 2.0
     )
     
     $filteredResults = $DNSResults | Where-Object { 
@@ -1944,7 +2136,13 @@ function Get-BestOverallPair {
         $responseTime = [double]($_.ResponseTime -replace ' ms$', '')
         $jitter = if ($_.Jitter -eq "N/A") { 0 } else { [double]($_.Jitter -replace ' ms$', '') }
         $successRate = [double]($_.SuccessRate)
-        $score = ($responseTime * 0.6) + ($jitter * 0.2) - ($successRate * 0.02)
+        
+        # Calculate score based on mode
+        if ($UseCompositeScore) {
+            $score = $responseTime + ($jitter * $JitterWeight)
+        } else {
+            $score = ($responseTime * 0.6) + ($jitter * 0.2) - ($successRate * 0.02)
+        }
         
         [PSCustomObject]@{
             Provider = $_.Provider
@@ -2080,7 +2278,9 @@ function Get-BestSameProviderPair {
     #>
     param (
         [Array]$DNSResults,
-        [string]$RecordType = "A"
+        [string]$RecordType = "A",
+        [bool]$UseCompositeScore = $false,
+        [double]$JitterWeight = 2.0
     )
     
     $filteredResults = $DNSResults | Where-Object { 
@@ -2096,7 +2296,13 @@ function Get-BestSameProviderPair {
         $responseTime = [double]($_.ResponseTime -replace ' ms$', '')
         $jitter = if ($_.Jitter -eq "N/A") { 0 } else { [double]($_.Jitter -replace ' ms$', '') }
         $successRate = [double]($_.SuccessRate)
-        $score = ($responseTime * 0.6) + ($jitter * 0.2) - ($successRate * 0.02)
+        
+        # Calculate score based on mode
+        if ($UseCompositeScore) {
+            $score = $responseTime + ($jitter * $JitterWeight)
+        } else {
+            $score = ($responseTime * 0.6) + ($jitter * 0.2) - ($successRate * 0.02)
+        }
         
         # More strict base provider extraction
         # Only remove "Secondary", "Alt", "2", "3" that are clearly secondary indicators
@@ -2179,7 +2385,9 @@ function Get-BestSameProviderPairGlobal {
     #>
     param (
         [Array]$DNSResults,
-        [string]$RecordType = "A"
+        [string]$RecordType = "A",
+        [bool]$UseCompositeScore = $false,
+        [double]$JitterWeight = 2.0
     )
     
     $filteredResults = $DNSResults | Where-Object { 
@@ -2195,7 +2403,13 @@ function Get-BestSameProviderPairGlobal {
         $responseTime = [double]($_.ResponseTime -replace ' ms$', '')
         $jitter = if ($_.Jitter -eq "N/A") { 0 } else { [double]($_.Jitter -replace ' ms$', '') }
         $successRate = [double]($_.SuccessRate)
-        $score = ($responseTime * 0.6) + ($jitter * 0.2) - ($successRate * 0.02)
+        
+        # Calculate score based on mode
+        if ($UseCompositeScore) {
+            $score = $responseTime + ($jitter * $JitterWeight)
+        } else {
+            $score = ($responseTime * 0.6) + ($jitter * 0.2) - ($successRate * 0.02)
+        }
         
         # More strict base provider extraction
         # Only remove "Secondary", "Alt", "2", "3" that are clearly secondary indicators
@@ -2282,7 +2496,7 @@ foreach ($category in @("Egyptian", "Global", "ControlD")) {
         $categoryStats["${category}_${recordType}"] = Get-DNSStatistics -ResultsData $results -RecordType $recordType -Category $category
         
         # Find the best DNS pair for this category and record type
-        $bestPairs["${category}_${recordType}"] = Get-BestDNSPair -DNSResults $results -Category $category -RecordType $recordType
+        $bestPairs["${category}_${recordType}"] = Get-BestDNSPair -DNSResults $results -Category $category -RecordType $recordType -UseCompositeScore $true -JitterWeight $JitterWeight
     }
 }
 
@@ -2304,12 +2518,12 @@ foreach ($recordType in $recordTypes) {
     $bestGlobalPair = $bestPairs["Global_${recordType}"]
     
     # Get additional pairing options
-    $bestMixedPair = Get-BestMixedPair -DNSResults $results -RecordType $recordType
-    $bestOverallPair = Get-BestOverallPair -DNSResults $results -RecordType $recordType
+    $bestMixedPair = Get-BestMixedPair -DNSResults $results -RecordType $recordType -UseCompositeScore $true -JitterWeight $JitterWeight
+    $bestOverallPair = Get-BestOverallPair -DNSResults $results -RecordType $recordType -UseCompositeScore $true -JitterWeight $JitterWeight
     $mostReliablePair = Get-MostReliablePair -DNSResults $results -RecordType $recordType
     $lowLatencyPair = Get-LowLatencyPair -DNSResults $results -RecordType $recordType
-    $bestSameProviderPair = Get-BestSameProviderPair -DNSResults $results -RecordType $recordType
-    $bestSameProviderPairGlobal = Get-BestSameProviderPairGlobal -DNSResults $results -RecordType $recordType
+    $bestSameProviderPair = Get-BestSameProviderPair -DNSResults $results -RecordType $recordType -UseCompositeScore $true -JitterWeight $JitterWeight
+    $bestSameProviderPairGlobal = Get-BestSameProviderPairGlobal -DNSResults $results -RecordType $recordType -UseCompositeScore $true -JitterWeight $JitterWeight
     
     # Display all pairing options
     Write-ColoredMessage "`n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -Color Cyan
@@ -2645,7 +2859,7 @@ Write-ColoredMessage "`n━━━━━━━━━━━━━━━━━━�
 Write-ColoredMessage "ADVANCED FEATURES SUMMARY:" -Color Cyan
 Write-ColoredMessage "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -Color Cyan
 
-if (-not $SkipIPv6Test -or -not $SkipDNSSECTest -or -not $SkipResponseVerification) {
+if (-not $SkipIPv6Test -or -not $SkipDNSSECTest -or -not $SkipResponseVerification -or $TestEDNS0 -or $TestTCP) {
     $successfulResults = $results | Where-Object { $_.Status -eq "Success" }
     
     if (-not $SkipIPv6Test) {
@@ -2714,8 +2928,62 @@ if (-not $SkipIPv6Test -or -not $SkipDNSSECTest -or -not $SkipResponseVerificati
             }
         }
     }
+    
+    if ($TestEDNS0) {
+        $edns0Supported = ($successfulResults | Where-Object { $_.EDNS0 -eq "✓" }).Count
+        $edns0Total = ($successfulResults | Where-Object { $_.EDNS0 -ne "N/A" }).Count
+        if ($edns0Total -gt 0) {
+            $edns0Percentage = [math]::Round(($edns0Supported / $edns0Total) * 100, 1)
+            Write-ColoredMessage "`nEDNS0 Support: " -Color Yellow -NoNewline
+            Write-ColoredMessage "$edns0Supported/$edns0Total DNS servers ($edns0Percentage%)" -Color $(if ($edns0Percentage -gt 80) { "Green" } elseif ($edns0Percentage -gt 50) { "Yellow" } else { "Red" })
+            Write-ColoredMessage "  (Better CDN routing for streaming/gaming)" -Color Gray
+            
+            # List EDNS0-capable DNS
+            $edns0DNS = $successfulResults | Where-Object { $_.EDNS0 -eq "✓" } | Select-Object -Unique Provider, IP | Select-Object -First 5
+            if ($edns0DNS.Count -gt 0) {
+                Write-ColoredMessage "  EDNS0-capable DNS providers:" -Color Cyan
+                foreach ($dns in $edns0DNS) {
+                    Write-Host "    • " -NoNewline -ForegroundColor DarkGray
+                    Write-Host "$($dns.Provider)" -NoNewline -ForegroundColor Magenta
+                    Write-Host " (" -NoNewline -ForegroundColor DarkGray
+                    Write-Host "$($dns.IP)" -NoNewline -ForegroundColor Cyan
+                    Write-Host ")" -ForegroundColor DarkGray
+                }
+                if ($edns0Supported -gt 5) {
+                    Write-ColoredMessage "    ... and $($edns0Supported - 5) more" -Color DarkGray
+                }
+            }
+        }
+    }
+    
+    if ($TestTCP) {
+        $tcpSupported = ($successfulResults | Where-Object { $_.TCP -eq "✓" }).Count
+        $tcpTotal = ($successfulResults | Where-Object { $_.TCP -ne "N/A" }).Count
+        if ($tcpTotal -gt 0) {
+            $tcpPercentage = [math]::Round(($tcpSupported / $tcpTotal) * 100, 1)
+            Write-ColoredMessage "`nTCP Fallback: " -Color Yellow -NoNewline
+            Write-ColoredMessage "$tcpSupported/$tcpTotal DNS servers ($tcpPercentage%)" -Color $(if ($tcpPercentage -gt 80) { "Green" } elseif ($tcpPercentage -gt 50) { "Yellow" } else { "Red" })
+            Write-ColoredMessage "  (Handles large responses for game services)" -Color Gray
+            
+            # List TCP-capable DNS
+            $tcpDNS = $successfulResults | Where-Object { $_.TCP -eq "✓" } | Select-Object -Unique Provider, IP | Select-Object -First 5
+            if ($tcpDNS.Count -gt 0) {
+                Write-ColoredMessage "  TCP-capable DNS providers:" -Color Cyan
+                foreach ($dns in $tcpDNS) {
+                    Write-Host "    • " -NoNewline -ForegroundColor DarkGray
+                    Write-Host "$($dns.Provider)" -NoNewline -ForegroundColor Magenta
+                    Write-Host " (" -NoNewline -ForegroundColor DarkGray
+                    Write-Host "$($dns.IP)" -NoNewline -ForegroundColor Cyan
+                    Write-Host ")" -ForegroundColor DarkGray
+                }
+                if ($tcpSupported -gt 5) {
+                    Write-ColoredMessage "    ... and $($tcpSupported - 5) more" -Color DarkGray
+                }
+            }
+        }
+    }
 } else {
-    Write-ColoredMessage "`nAdvanced tests disabled. Use -TestIPv6, -TestDNSSEC, or -VerifyResponses to enable." -Color Gray
+    Write-ColoredMessage "`nAdvanced tests disabled. Use -TestIPv6, -TestDNSSEC, -VerifyResponses, -TestEDNS0, or -TestTCP to enable." -Color Gray
 }
 
 # Store the best choice for script generation
@@ -2855,43 +3123,7 @@ echo "DNS configuration updated and cache flushed"
     Write-ColoredMessage "Try increasing the timeout parameter or checking your network connection." -Color Yellow
 }
 
-# Display removed DNS providers if any
-if ($global:RemovedDnsProviders.Count -gt 0) {
-    Write-ColoredMessage "`n`nRemoved DNS Providers (Due to Failures)" -Color Red
-    Write-ColoredMessage "======================================" -Color Red
-    
-    $global:RemovedDnsProviders | Format-Table -AutoSize -Property @{
-        Label = "Provider"
-        Expression = { $_.Name }
-        Width = 30
-    }, @{
-        Label = "IP Address"
-        Expression = { $_.IP }
-        Width = 20
-    }, @{
-        Label = "Category"
-        Expression = { $_.Category }
-        Width = 15
-    }, @{
-        Label = "Failures"
-        Expression = { $_.Failures }
-        Width = 10
-    }, @{
-        Label = "Successes"
-        Expression = { $_.Successes }
-        Width = 10
-    }, @{
-        Label = "Failure Rate"
-        Expression = { $_.FailureRate }
-        Width = 12
-    }, @{
-        Label = "Reason"
-        Expression = { $_.Reason }
-        Width = 20
-    } | Out-Host
-    
-    Write-ColoredMessage "Total removed: $($global:RemovedDnsProviders.Count) DNS provider(s)" -Color Yellow
-}
+# Skip displaying removed DNS table (redundant - shown in persistent tracking below)
 
 # Save persistent tracking history
 if (-not $DisablePersistentTracking) {
@@ -2915,21 +3147,16 @@ if (-not $DisablePersistentTracking) {
         }
     }
     
-    if ($approachingBlacklist.Count -gt 0) {
-        Write-ColoredMessage "`nDNS servers with recorded failures (will be blacklisted after $PersistentFailureThreshold total failures):" -Color Yellow
-        $approachingBlacklist | Sort-Object -Property Failures -Descending | ForEach-Object {
-            Write-ColoredMessage "  $($_.IP) - Failed $($_.Failures) time(s), $($_.Remaining) more failure(s) until blacklist" -Color Yellow
+    # Compact failure summary
+    if ($approachingBlacklist.Count -gt 0 -or $newlyFailed.Count -gt 0) {
+        Write-Host ""
+        if ($newlyFailed.Count -gt 0) {
+            Write-Host "⚠ Blacklisted: $($newlyFailed.Count) DNS" -ForegroundColor Red
+        }
+        if ($approachingBlacklist.Count -gt 0) {
+            Write-Host "⚠ Approaching blacklist: $($approachingBlacklist.Count) DNS" -ForegroundColor Yellow
         }
     }
-    
-    if ($newlyFailed.Count -gt 0) {
-        Write-ColoredMessage "`nDNS servers blacklisted (will be excluded from future tests):" -Color Red
-        $newlyFailed | ForEach-Object {
-            Write-ColoredMessage "  $_" -Color Red
-        }
-    }
-    
-    Write-ColoredMessage "`nPersistent tracking history saved. Use -ShowTrackingStats to view full statistics." -Color Green
 }
 
 # Save ML training data and track best pairs

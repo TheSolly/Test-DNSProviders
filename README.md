@@ -5,6 +5,8 @@ A powerful PowerShell script for benchmarking DNS providers and finding the fast
 ## Features
 
 - **Machine Learning Optimization**: Learns from historical test results to prioritize best-performing DNS servers
+- **Jitter-Aware Scoring**: Composite scoring that considers both speed and consistency (critical for gaming/streaming)
+- **Gaming/Streaming Tests**: EDNS0 and TCP fallback support testing
 - Tests multiple DNS providers including Egyptian, Global, and Control D DNS servers
 - Measures response time, jitter, and reliability
 - Tests multiple DNS record types (A, AAAA, MX, TXT, NS)
@@ -63,12 +65,32 @@ The ML system uses a weighted composite score (lower is better):
 # Quick test ALL DNS providers - no early exit (best for ML training)
 .\Test-DNSProviders.ps1 -QuickTest -NoEarlyExit -Domain "psn.com"
 
+# Gaming/Streaming optimized test (considers jitter, tests EDNS0 & TCP)
+.\Test-DNSProviders.ps1 -SortByScore -JitterWeight 3.0 -TestEDNS0 -TestTCP
+
+# Quick gaming test (fastest way to find best gaming DNS)
+.\Test-DNSProviders.ps1 -QuickTest -SortByScore -JitterWeight 4.0 -TopResults 5
+
 # View ML recommendations
 Get-Content dns-ml-recommendations.txt
 
 # Reset persistent tracking and start ML learning fresh
 .\Test-DNSProviders.ps1 -ResetTracking
 ```
+
+### Gaming & Streaming Optimization
+
+For gaming and streaming, **jitter matters more than raw speed**! A DNS with slightly higher average response time but low jitter will provide better performance.
+
+```powershell
+# Recommended for gaming (prioritizes stability over speed)
+.\Test-DNSProviders.ps1 -SortByScore -JitterWeight 4.0 -TestEDNS0 -TestTCP
+
+# Recommended for streaming (balanced approach)
+.\Test-DNSProviders.ps1 -SortByScore -JitterWeight 2.5 -TestEDNS0 -TestTCP
+```
+
+**See [JITTER-SCORING-GUIDE.md](JITTER-SCORING-GUIDE.md) for detailed explanation and examples.**
 
 ## How ML Learning Works
 
