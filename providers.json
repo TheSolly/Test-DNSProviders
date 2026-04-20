@@ -1,0 +1,546 @@
+{
+  "$schema": "./providers.schema.json",
+  "version": 2,
+  "providers": [
+    {
+      "name": "TE-Data Primary",
+      "ip": "163.121.128.135",
+      "category": "Egyptian"
+    },
+    {
+      "name": "TE-Data Secondary",
+      "ip": "163.121.128.134",
+      "category": "Egyptian"
+    },
+    {
+      "name": "Google DNS",
+      "ip": "8.8.8.8",
+      "category": "Global"
+    },
+    {
+      "name": "Google DNS Secondary",
+      "ip": "8.8.4.4",
+      "category": "Global"
+    },
+    {
+      "name": "Cloudflare DNS",
+      "ip": "1.1.1.1",
+      "category": "Global"
+    },
+    {
+      "name": "Cloudflare DNS Secondary",
+      "ip": "1.0.0.1",
+      "category": "Global"
+    },
+    {
+      "name": "Cloudflare Family",
+      "ip": "1.1.1.3",
+      "category": "Global"
+    },
+    {
+      "name": "Cloudflare Family Secondary",
+      "ip": "1.0.0.3",
+      "category": "Global"
+    },
+    {
+      "name": "Cloudflare for Teams",
+      "ip": "1.1.1.2",
+      "category": "Global"
+    },
+    {
+      "name": "Cloudflare for Teams Alt",
+      "ip": "1.0.0.2",
+      "category": "Global"
+    },
+    {
+      "name": "OpenDNS",
+      "ip": "208.67.222.222",
+      "category": "Global"
+    },
+    {
+      "name": "OpenDNS Secondary",
+      "ip": "208.67.220.220",
+      "category": "Global"
+    },
+    {
+      "name": "OpenDNS Family Shield",
+      "ip": "208.67.222.123",
+      "category": "Global"
+    },
+    {
+      "name": "OpenDNS Family Shield 2",
+      "ip": "208.67.220.123",
+      "category": "Global"
+    },
+    {
+      "name": "Quad9",
+      "ip": "9.9.9.9",
+      "category": "Global"
+    },
+    {
+      "name": "Quad9 Secondary",
+      "ip": "149.112.112.112",
+      "category": "Global"
+    },
+    {
+      "name": "Quad9 Secure",
+      "ip": "9.9.9.11",
+      "category": "Global"
+    },
+    {
+      "name": "Quad9 Secure Secondary",
+      "ip": "149.112.112.11",
+      "category": "Global"
+    },
+    {
+      "name": "Quad9 Unsecured",
+      "ip": "9.9.9.10",
+      "category": "Global"
+    },
+    {
+      "name": "Quad9 Unsecured Alt",
+      "ip": "149.112.112.10",
+      "category": "Global"
+    },
+    {
+      "name": "AdGuard DNS",
+      "ip": "94.140.14.14",
+      "category": "Global"
+    },
+    {
+      "name": "AdGuard DNS Secondary",
+      "ip": "94.140.15.15",
+      "category": "Global"
+    },
+    {
+      "name": "AdGuard Family",
+      "ip": "94.140.14.15",
+      "category": "Global"
+    },
+    {
+      "name": "AdGuard Family Secondary",
+      "ip": "94.140.15.16",
+      "category": "Global"
+    },
+    {
+      "name": "AdGuard Unfiltered",
+      "ip": "94.140.14.140",
+      "category": "Global"
+    },
+    {
+      "name": "AdGuard Unfiltered Alt",
+      "ip": "94.140.14.141",
+      "category": "Global"
+    },
+    {
+      "name": "CleanBrowsing",
+      "ip": "185.228.168.9",
+      "category": "Global"
+    },
+    {
+      "name": "CleanBrowsing Secondary",
+      "ip": "185.228.169.9",
+      "category": "Global"
+    },
+    {
+      "name": "CleanBrowsing Adult Filter",
+      "ip": "185.228.168.10",
+      "category": "Global"
+    },
+    {
+      "name": "CleanBrowsing Adult Filter 2",
+      "ip": "185.228.169.11",
+      "category": "Global"
+    },
+    {
+      "name": "CleanBrowsing Family",
+      "ip": "185.228.168.168",
+      "category": "Global"
+    },
+    {
+      "name": "CleanBrowsing Family Alt",
+      "ip": "185.228.169.168",
+      "category": "Global"
+    },
+    {
+      "name": "NextDNS",
+      "ip": "45.90.28.167",
+      "category": "Global"
+    },
+    {
+      "name": "NextDNS Secondary",
+      "ip": "45.90.30.167",
+      "category": "Global"
+    },
+    {
+      "name": "DNS.Watch",
+      "ip": "84.200.69.80",
+      "category": "Global"
+    },
+    {
+      "name": "DNS.Watch Secondary",
+      "ip": "84.200.70.40",
+      "category": "Global"
+    },
+    {
+      "name": "Comodo Secure DNS",
+      "ip": "8.26.56.26",
+      "category": "Global"
+    },
+    {
+      "name": "Comodo Secure DNS 2",
+      "ip": "8.20.247.20",
+      "category": "Global"
+    },
+    {
+      "name": "Level3 DNS",
+      "ip": "4.2.2.1",
+      "category": "Global"
+    },
+    {
+      "name": "Level3 DNS Secondary",
+      "ip": "4.2.2.2",
+      "category": "Global"
+    },
+    {
+      "name": "Level3 Alt 1",
+      "ip": "4.2.2.3",
+      "category": "Global"
+    },
+    {
+      "name": "Level3 Alt 2",
+      "ip": "4.2.2.4",
+      "category": "Global"
+    },
+    {
+      "name": "Verisign DNS",
+      "ip": "64.6.64.6",
+      "category": "Global"
+    },
+    {
+      "name": "Verisign DNS Secondary",
+      "ip": "64.6.65.6",
+      "category": "Global"
+    },
+    {
+      "name": "Mullvad DNS",
+      "ip": "194.242.2.2",
+      "category": "Global"
+    },
+    {
+      "name": "Mullvad DNS Alt",
+      "ip": "193.19.108.2",
+      "category": "Global"
+    },
+    {
+      "name": "CIRA Canadian Shield",
+      "ip": "149.112.121.10",
+      "category": "Global"
+    },
+    {
+      "name": "CIRA Canadian Shield Alt",
+      "ip": "149.112.122.10",
+      "category": "Global"
+    },
+    {
+      "name": "LibreDNS",
+      "ip": "116.202.176.26",
+      "category": "Global"
+    },
+    {
+      "name": "LibreDNS Alt",
+      "ip": "95.216.229.153",
+      "category": "Global"
+    },
+    {
+      "name": "DeCloudUs DNS",
+      "ip": "176.103.130.130",
+      "category": "Global"
+    },
+    {
+      "name": "DeCloudUs DNS Alt",
+      "ip": "176.103.130.131",
+      "category": "Global"
+    },
+    {
+      "name": "puntCAT DNS",
+      "ip": "109.69.8.51",
+      "category": "Global"
+    },
+    {
+      "name": "puntCAT DNS Alt",
+      "ip": "109.69.8.52",
+      "category": "Global"
+    },
+    {
+      "name": "Digitale Gesellschaft",
+      "ip": "185.95.218.42",
+      "category": "Global"
+    },
+    {
+      "name": "Digitale Gesellschaft Alt",
+      "ip": "185.95.218.43",
+      "category": "Global"
+    },
+    {
+      "name": "Foundation for Applied Privacy",
+      "ip": "146.255.56.98",
+      "category": "Global"
+    },
+    {
+      "name": "CZ.NIC ODVR",
+      "ip": "193.17.47.1",
+      "category": "Global"
+    },
+    {
+      "name": "CZ.NIC ODVR Alt",
+      "ip": "185.43.135.1",
+      "category": "Global"
+    },
+    {
+      "name": "BlahDNS Germany",
+      "ip": "159.69.198.101",
+      "category": "Global"
+    },
+    {
+      "name": "BlahDNS Japan",
+      "ip": "45.91.92.121",
+      "category": "Global"
+    },
+    {
+      "name": "BlahDNS Singapore",
+      "ip": "194.145.240.6",
+      "category": "Global"
+    },
+    {
+      "name": "Snopyta DNS",
+      "ip": "95.216.24.230",
+      "category": "Global"
+    },
+    {
+      "name": "Snopyta DNS Alt",
+      "ip": "161.97.219.84",
+      "category": "Global"
+    },
+    {
+      "name": "AhaDNS Netherlands",
+      "ip": "5.2.75.75",
+      "category": "Global"
+    },
+    {
+      "name": "AhaDNS Los Angeles",
+      "ip": "45.67.219.208",
+      "category": "Global"
+    },
+    {
+      "name": "AhaDNS India",
+      "ip": "45.79.120.233",
+      "category": "Global"
+    },
+    {
+      "name": "Namecheap DNS",
+      "ip": "198.54.117.10",
+      "category": "Global"
+    },
+    {
+      "name": "Namecheap DNS Alt",
+      "ip": "198.54.117.11",
+      "category": "Global"
+    },
+    {
+      "name": "Hurricane Electric",
+      "ip": "74.82.42.42",
+      "category": "Global"
+    },
+    {
+      "name": "Alternate DNS",
+      "ip": "76.76.19.19",
+      "category": "Global"
+    },
+    {
+      "name": "Alternate DNS 2",
+      "ip": "76.223.100.101",
+      "category": "Global"
+    },
+    {
+      "name": "UncensoredDNS",
+      "ip": "91.239.100.100",
+      "category": "Global"
+    },
+    {
+      "name": "UncensoredDNS Alt",
+      "ip": "89.233.43.71",
+      "category": "Global"
+    },
+    {
+      "name": "Safe DNS",
+      "ip": "195.46.39.39",
+      "category": "Global"
+    },
+    {
+      "name": "Safe DNS Alt",
+      "ip": "195.46.39.40",
+      "category": "Global"
+    },
+    {
+      "name": "FreeDNS",
+      "ip": "37.235.1.174",
+      "category": "Global"
+    },
+    {
+      "name": "FreeDNS Alt",
+      "ip": "37.235.1.177",
+      "category": "Global"
+    },
+    {
+      "name": "Yandex DNS Basic",
+      "ip": "77.88.8.8",
+      "category": "Global"
+    },
+    {
+      "name": "Yandex DNS Basic Alt",
+      "ip": "77.88.8.1",
+      "category": "Global"
+    },
+    {
+      "name": "Yandex DNS Safe",
+      "ip": "77.88.8.88",
+      "category": "Global"
+    },
+    {
+      "name": "Yandex DNS Family",
+      "ip": "77.88.8.7",
+      "category": "Global"
+    },
+    {
+      "name": "Control D Standard",
+      "ip": "76.76.2.0",
+      "category": "ControlD"
+    },
+    {
+      "name": "Control D Standard Secondary",
+      "ip": "76.76.10.0",
+      "category": "ControlD"
+    },
+    {
+      "name": "Control D Uncensored",
+      "ip": "76.76.2.1",
+      "category": "ControlD"
+    },
+    {
+      "name": "Control D Uncensored Secondary",
+      "ip": "76.76.10.1",
+      "category": "ControlD"
+    },
+    {
+      "name": "Control D Family",
+      "ip": "76.76.2.3",
+      "category": "ControlD"
+    },
+    {
+      "name": "Control D Family Secondary",
+      "ip": "76.76.10.3",
+      "category": "ControlD"
+    },
+
+    {
+      "name": "Cloudflare DoH",
+      "ip": "1.1.1.1",
+      "category": "Encrypted",
+      "protocol": "doh",
+      "url": "https://cloudflare-dns.com/dns-query",
+      "hostname": "cloudflare-dns.com"
+    },
+    {
+      "name": "Cloudflare DoT",
+      "ip": "1.1.1.1",
+      "category": "Encrypted",
+      "protocol": "dot",
+      "hostname": "cloudflare-dns.com"
+    },
+    {
+      "name": "Google DoH",
+      "ip": "8.8.8.8",
+      "category": "Encrypted",
+      "protocol": "doh",
+      "url": "https://dns.google/dns-query",
+      "hostname": "dns.google"
+    },
+    {
+      "name": "Google DoT",
+      "ip": "8.8.8.8",
+      "category": "Encrypted",
+      "protocol": "dot",
+      "hostname": "dns.google"
+    },
+    {
+      "name": "Quad9 DoH",
+      "ip": "9.9.9.9",
+      "category": "Encrypted",
+      "protocol": "doh",
+      "url": "https://dns.quad9.net/dns-query",
+      "hostname": "dns.quad9.net"
+    },
+    {
+      "name": "Quad9 DoT",
+      "ip": "9.9.9.9",
+      "category": "Encrypted",
+      "protocol": "dot",
+      "hostname": "dns.quad9.net"
+    },
+    {
+      "name": "AdGuard DoH",
+      "ip": "94.140.14.14",
+      "category": "Encrypted",
+      "protocol": "doh",
+      "url": "https://dns.adguard-dns.com/dns-query",
+      "hostname": "dns.adguard-dns.com"
+    },
+    {
+      "name": "AdGuard DoT",
+      "ip": "94.140.14.14",
+      "category": "Encrypted",
+      "protocol": "dot",
+      "hostname": "dns.adguard-dns.com"
+    },
+    {
+      "name": "NextDNS DoH",
+      "ip": "45.90.28.0",
+      "category": "Encrypted",
+      "protocol": "doh",
+      "url": "https://dns.nextdns.io",
+      "hostname": "dns.nextdns.io"
+    },
+
+    {
+      "name": "Cloudflare IPv6",
+      "ip": "2606:4700:4700::1111",
+      "category": "IPv6"
+    },
+    {
+      "name": "Cloudflare IPv6 Secondary",
+      "ip": "2606:4700:4700::1001",
+      "category": "IPv6"
+    },
+    {
+      "name": "Google IPv6",
+      "ip": "2001:4860:4860::8888",
+      "category": "IPv6"
+    },
+    {
+      "name": "Google IPv6 Secondary",
+      "ip": "2001:4860:4860::8844",
+      "category": "IPv6"
+    },
+    {
+      "name": "Quad9 IPv6",
+      "ip": "2620:fe::fe",
+      "category": "IPv6"
+    },
+    {
+      "name": "Quad9 IPv6 Secondary",
+      "ip": "2620:fe::9",
+      "category": "IPv6"
+    }
+  ]
+}

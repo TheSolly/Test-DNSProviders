@@ -2,7 +2,7 @@
 # Tests DNS providers for speed and reliability
 # Created: May 2025
 
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
 param(
     [Parameter(HelpMessage="Domain to test DNS resolution (default: example.com)")]
     [string]$Domain = "example.com",
@@ -28,12 +28,19 @@ param(
     
     [Parameter(HelpMessage="Number of consecutive failures before flagging DNS as problematic (default: 3)")]
     [int]$FailureThreshold = 3,
-      [Parameter(HelpMessage="Test only specific DNS categories: All, Egyptian, Global, ControlD (default: All)")]
-    [ValidateSet("All", "Egyptian", "Global", "ControlD")]
+      [Parameter(HelpMessage="Test only specific DNS categories: All, Egyptian, Global, ControlD, Encrypted, IPv6 (default: All)")]
+    [ValidateSet("All", "Egyptian", "Global", "ControlD", "Encrypted", "IPv6")]
     [string]$Category = "All",
+    
+    [Parameter(HelpMessage="Filter providers by transport protocol: All, Do53 (classic UDP/53), DoH (DNS-over-HTTPS), DoT (DNS-over-TLS). Default: All.")]
+    [ValidateSet("All", "Do53", "DoH", "DoT")]
+    [string]$Protocol = "All",
     
     [Parameter(HelpMessage="Path to export results as CSV")]
     [string]$ExportPath,
+    
+    [Parameter(HelpMessage="Path to export results as JSON (full structured output, including capability flags and statistics)")]
+    [string]$ExportJson,
     
     [Parameter(HelpMessage="Test different DNS record types")]
     [switch]$MultiRecordTest,
@@ -94,9 +101,45 @@ param(
     [Parameter(HelpMessage="Test TCP fallback support (critical for gaming/streaming large responses)")]
     [switch]$TestTCP,
     
+    [Parameter(HelpMessage="Test content-filtering capabilities (malware/ads/adult) using canary domains. Reports per-category block status.")]
+    [switch]$TestFiltering,
+    
     [Parameter(HelpMessage="Jitter weight multiplier for scoring (default: 2.0, higher = jitter matters more)")]
     [ValidateRange(0.0, 10.0)]
-    [double]$JitterWeight = 2.0
+    [double]$JitterWeight = 2.0,
+
+    [Parameter(HelpMessage="Sort results by composite score (response time + jitter * JitterWeight) instead of raw response time")]
+    [switch]$SortByScore,
+
+    [Parameter(HelpMessage="Defeat recursive-resolver caching by prefixing each performance probe with a random subdomain (forces real upstream lookup; responses are typically NXDOMAIN). Reliability and capability probes are unaffected.")]
+    [switch]$CacheBust,
+
+    [Parameter(HelpMessage="Number of automatic retries (with exponential backoff) for a transiently timed-out performance probe before counting it as failed (default: 1, 0 disables)")]
+    [ValidateRange(0, 5)]
+    [int]$MaxRetries = 1,
+
+    [Parameter(HelpMessage="ML scoring profile that selects how the scorer weighs response time, jitter, success rate, trend, and advanced features. Default = balanced general-purpose.")]
+    [ValidateSet('Default','Gaming','Streaming','Browsing','Privacy')]
+    [string]$MLProfile = 'Default',
+
+    [Parameter(HelpMessage="Maximum concurrent DNS probes when running in -Parallel mode. Higher = faster but heavier on the network. Default = 16.")]
+    [ValidateRange(1, 128)]
+    [int]$MaxThreads = 16,
+
+    [Parameter(HelpMessage="Apply the recommended DNS pair to the system after testing. Honors -WhatIf and -Confirm. Requires Administrator on Windows.")]
+    [switch]$ApplyDNS,
+
+    [Parameter(HelpMessage="Network adapter alias pattern to apply DNS to (Windows only, default 'Ethernet*'). Supports wildcards.")]
+    [string]$InterfaceAlias = 'Ethernet*',
+
+    [Parameter(HelpMessage="Path to a JSON-lines structured log file. Each test attempt and lifecycle event becomes one JSON object on its own line.")]
+    [string]$LogPath,
+
+    [Parameter(HelpMessage="Suppress the chatty per-probe console output (banners, results table, recommendations and exports still print).")]
+    [switch]$Quiet,
+
+    [Parameter(HelpMessage="Path to write a self-contained HTML report of the run.")]
+    [string]$ExportHtml
 )
 
 # Check if required modules are available
@@ -135,20 +178,225 @@ if ($QuickTest) {
 }
 
 # Global variables for failure tracking
-$global:DnsFailureTracker = @{}
-$global:DnsSuccessTracker = @{}
-$global:RemovedDnsProviders = @()
-$global:PersistentTrackingFile = Join-Path $PSScriptRoot "dns-failure-history.json"
+$script:DnsFailureTracker = @{}
+$script:DnsSuccessTracker = @{}
+$script:RemovedDnsProviders = @()
+$script:PersistentTrackingFile = Join-Path $PSScriptRoot "dns-failure-history.json"
 
 # Import ML Scorer Module
 try {
-    . (Join-Path $PSScriptRoot "DNS-ML-Scorer.ps1")
-    $global:MLEnabled = $true
-    $global:MLData = Initialize-MLData
+    $mlModulePath = Join-Path $PSScriptRoot "DNS-ML-Scorer.psd1"
+    if (-not (Test-Path $mlModulePath)) {
+        # Fall back to the raw .psm1 if the manifest is missing
+        $mlModulePath = Join-Path $PSScriptRoot "DNS-ML-Scorer.psm1"
+    }
+    Import-Module $mlModulePath -Force -DisableNameChecking -ErrorAction Stop
+    $script:MLEnabled = $true
+    $script:MLData = Initialize-MLData
+
+    # Apply selected scoring profile so all downstream calls use the right weights.
+    if (Get-Command Set-MLProfile -ErrorAction SilentlyContinue) {
+        try {
+            Set-MLProfile -MLData $script:MLData -ProfileName $MLProfile
+        } catch {
+            Write-Warning "Failed to apply ML profile '$MLProfile': $_"
+        }
+    }
 } catch {
     Write-Warning "ML Scorer module not available. Running without ML optimization: $_"
-    $global:MLEnabled = $false
-    $global:MLData = $null
+    $script:MLEnabled = $false
+    $script:MLData = $null
+}
+
+# ============================================================================
+# Encrypted-DNS wire-protocol module (DoH / DoT). Optional - if missing, the
+# script still works for classic Do53 providers but skips DoH/DoT entries.
+# ============================================================================
+$script:EncryptedDnsAvailable = $false
+try {
+    $wirePath = Join-Path $PSScriptRoot 'DnsWireProtocol.psm1'
+    if (Test-Path -LiteralPath $wirePath) {
+        Import-Module $wirePath -Force -DisableNameChecking -ErrorAction Stop
+        $script:EncryptedDnsAvailable = $true
+    }
+} catch {
+    Write-Warning "DnsWireProtocol module failed to load: $_. DoH/DoT providers will be skipped."
+}
+
+# ============================================================================
+# Runspace pool for cheap, in-process scriptblock execution with timeout.
+# ============================================================================
+# Replaces the old Start-Job/Wait-Job/Receive-Job/Remove-Job pattern, which
+# spawned a fresh powershell.exe child for every DNS probe (~150-300 ms of
+# pure overhead per call). The runspace pool keeps a small set of warm
+# in-process runspaces and reuses them, cutting per-call overhead to ~1-5 ms.
+$script:DnsRunspacePool = $null
+
+function Get-DnsRunspacePool {
+    if ($null -eq $script:DnsRunspacePool -or $script:DnsRunspacePool.RunspacePoolStateInfo.State -ne 'Opened') {
+        $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+        # MaxThreads governs the *outer* parallel test loop too; for the
+        # synchronous (timeout-bound) helper a small ceiling is enough, but
+        # we want headroom when -Parallel is also active.
+        $max = [Math]::Max(8, [int]$script:MaxThreads)
+        $pool = [runspacefactory]::CreateRunspacePool(1, $max, $iss, $Host)
+        $pool.ApartmentState = 'STA'
+        $pool.Open()
+        $script:DnsRunspacePool = $pool
+    }
+    return $script:DnsRunspacePool
+}
+
+function Invoke-DnsScriptBlockWithTimeout {
+    <#
+    .SYNOPSIS
+    Runs a scriptblock with a hard timeout using a shared runspace pool.
+
+    .OUTPUTS
+    The scriptblock's return value, OR a synthetic
+    @{ Success = $false; Error = 'Timeout' } hashtable on timeout, OR
+    @{ Success = $false; Error = '<msg>' } on a runtime exception.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [scriptblock]$ScriptBlock,
+        [object[]]$ArgumentList = @(),
+        [Parameter(Mandatory)] [int]$TimeoutSeconds
+    )
+
+    $pool = Get-DnsRunspacePool
+    $ps = [powershell]::Create()
+    $ps.RunspacePool = $pool
+    [void]$ps.AddScript($ScriptBlock)
+    foreach ($arg in $ArgumentList) { [void]$ps.AddArgument($arg) }
+
+    $async = $ps.BeginInvoke()
+    try {
+        # Wait up to TimeoutSeconds; AsyncWaitHandle.WaitOne expects ms.
+        if ($async.AsyncWaitHandle.WaitOne([int]([Math]::Max(1, $TimeoutSeconds) * 1000))) {
+            try {
+                $result = $ps.EndInvoke($async)
+            } catch {
+                return @{ Success = $false; Error = $_.Exception.Message }
+            }
+            # Scriptblocks may emit a single hashtable; PowerShell wraps it in
+            # a Collection. Unwrap to keep parity with Receive-Job semantics.
+            if ($result -and $result.Count -eq 1) { return $result[0] }
+            return $result
+        } else {
+            try { $ps.Stop() } catch { }
+            return @{ Success = $false; Error = 'Timeout' }
+        }
+    } finally {
+        $ps.Dispose()
+    }
+}
+
+# ============================================================================
+# Unified DNS probe dispatcher. Hides the Do53 / DoH / DoT distinction from
+# the rest of the script, returning a uniform shape:
+#   @{ Success=$bool; ResponseTimeMs=$double; Error=$string }
+# ResponseTimeMs reflects wall-clock for Do53 (since Resolve-DnsName doesn't
+# expose per-call timing), and the wire-level round-trip for DoH/DoT.
+# ============================================================================
+function Invoke-DnsProbe {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] [string]$IP,
+        [Parameter(Mandatory)] [string]$Domain,
+        [string]$RecordType = 'A',
+        [string]$ProbeProtocol = 'do53',
+        [string]$Url = '',
+        [string]$Hostname = '',
+        [Parameter(Mandatory)] [int]$TimeoutSeconds
+    )
+
+    $proto = $ProbeProtocol.ToLower()
+
+    if ($proto -eq 'doh') {
+        if (-not $script:EncryptedDnsAvailable) {
+            return @{ Success = $false; Error = 'DoH module unavailable' }
+        }
+        $r = Test-DoHQuery -Url $Url -Domain $Domain -RecordType $RecordType -TimeoutMs ($TimeoutSeconds * 1000)
+        if ($r.Success) {
+            return @{ Success = $true; ResponseTimeMs = [double]$r.ResponseTimeMs }
+        } else {
+            return @{ Success = $false; Error = $r.Error }
+        }
+    }
+    elseif ($proto -eq 'dot') {
+        if (-not $script:EncryptedDnsAvailable) {
+            return @{ Success = $false; Error = 'DoT module unavailable' }
+        }
+        $r = Test-DoTQuery -ServerIP $IP -Hostname $Hostname -Domain $Domain -RecordType $RecordType -TimeoutMs ($TimeoutSeconds * 1000)
+        if ($r.Success) {
+            return @{ Success = $true; ResponseTimeMs = [double]$r.ResponseTimeMs }
+        } else {
+            return @{ Success = $false; Error = $r.Error }
+        }
+    }
+    else {
+        # do53 - classic Resolve-DnsName, wrapped in the timeout helper so
+        # PSv5's lack of per-call timeout is enforced by us.
+        $sb = {
+            param($dnsIP, $dom, $rtype)
+            try {
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                Resolve-DnsName -Server $dnsIP -Name $dom -Type $rtype -DnsOnly -ErrorAction Stop | Out-Null
+                $sw.Stop()
+                return @{ Success = $true; ResponseTimeMs = $sw.Elapsed.TotalMilliseconds }
+            } catch {
+                return @{ Success = $false; Error = $_.Exception.Message }
+            }
+        }
+        $res = Invoke-DnsScriptBlockWithTimeout -ScriptBlock $sb -ArgumentList @($IP, $Domain, $RecordType) -TimeoutSeconds $TimeoutSeconds
+        if ($res -and $res.Success) {
+            return @{ Success = $true; ResponseTimeMs = [double]$res.ResponseTimeMs }
+        } else {
+            $err = if ($res -and $res.Error) { $res.Error } else { 'Unknown error' }
+            return @{ Success = $false; Error = $err }
+        }
+    }
+}
+
+# Statistics helpers
+# ==================
+
+function Get-Percentile {
+    <#
+    .SYNOPSIS
+    Returns a percentile value from a numeric array using linear interpolation
+    between adjacent ranks. Returns 0 if the array is empty.
+    #>
+    param(
+        [double[]]$Values,
+        [ValidateRange(0.0, 100.0)]
+        [double]$Percentile = 50.0
+    )
+
+    if ($null -eq $Values -or $Values.Count -eq 0) { return 0.0 }
+    if ($Values.Count -eq 1) { return [double]$Values[0] }
+
+    $sorted = $Values | Sort-Object
+    $rank = ($Percentile / 100.0) * ($sorted.Count - 1)
+    $lower = [Math]::Floor($rank)
+    $upper = [Math]::Ceiling($rank)
+    if ($lower -eq $upper) { return [double]$sorted[$lower] }
+    $weight = $rank - $lower
+    return ([double]$sorted[$lower] * (1.0 - $weight)) + ([double]$sorted[$upper] * $weight)
+}
+
+function Get-CacheBustingDomain {
+    <#
+    .SYNOPSIS
+    Prefixes the supplied domain with a short random label so the recursive
+    resolver cannot serve the response from cache. Most random subdomains of
+    public test domains return NXDOMAIN, which is exactly what we want for
+    measuring upstream lookup latency rather than cache-hit speed.
+    #>
+    param([string]$Domain)
+    $rand = ([guid]::NewGuid().ToString('N')).Substring(0, 8)
+    return "r$rand.$Domain"
 }
 
 # Persistent DNS Failure Tracking Functions
@@ -163,9 +411,9 @@ function Initialize-PersistentTracking {
         return @{}
     }
     
-    if (Test-Path $global:PersistentTrackingFile) {
+    if (Test-Path $script:PersistentTrackingFile) {
         try {
-            $content = Get-Content $global:PersistentTrackingFile -Raw | ConvertFrom-Json
+            $content = Get-Content $script:PersistentTrackingFile -Raw | ConvertFrom-Json
             $history = @{}
             
             # Convert from JSON object to hashtable
@@ -181,7 +429,15 @@ function Initialize-PersistentTracking {
             
             return $history
         } catch {
-            Write-Warning "Failed to load persistent tracking data: $_"
+            $backupPath = "$($script:PersistentTrackingFile).corrupt-$(Get-Date -Format 'yyyyMMdd-HHmmss').bak"
+            Write-Warning "Failed to load persistent tracking data ($_)."
+            try {
+                Copy-Item -Path $script:PersistentTrackingFile -Destination $backupPath -Force -ErrorAction Stop
+                Write-Warning "Corrupt tracking file backed up to: $backupPath"
+            } catch {
+                Write-Warning "Could not back up corrupt tracking file: $_"
+            }
+            Write-Warning "Starting with empty tracking history."
             return @{}
         }
     }
@@ -216,7 +472,7 @@ function Save-PersistentTracking {
             }
         }
         
-        $jsonObject | ConvertTo-Json -Depth 10 | Set-Content $global:PersistentTrackingFile -Force
+        $jsonObject | ConvertTo-Json -Depth 10 | Set-Content $script:PersistentTrackingFile -Force
     } catch {
         Write-Warning "Failed to save persistent tracking data: $_"
     }
@@ -365,15 +621,15 @@ function Update-DnsTracker {
     
     $key = "$DnsIP|$ProviderName"
     
-    if (-not $global:DnsFailureTracker.ContainsKey($key)) {
-        $global:DnsFailureTracker[$key] = 0
-        $global:DnsSuccessTracker[$key] = 0
+    if (-not $script:DnsFailureTracker.ContainsKey($key)) {
+        $script:DnsFailureTracker[$key] = 0
+        $script:DnsSuccessTracker[$key] = 0
     }
     
     if ($Success) {
-        $global:DnsSuccessTracker[$key]++
+        $script:DnsSuccessTracker[$key]++
     } else {
-        $global:DnsFailureTracker[$key]++
+        $script:DnsFailureTracker[$key]++
     }
 }
 
@@ -388,12 +644,12 @@ function Test-DnsRemoval {
     
     $key = "$DnsIP|$ProviderName"
     
-    if (-not $global:DnsFailureTracker.ContainsKey($key)) {
+    if (-not $script:DnsFailureTracker.ContainsKey($key)) {
         return $false
     }
     
-    $failures = $global:DnsFailureTracker[$key]
-    $successes = $global:DnsSuccessTracker[$key]
+    $failures = $script:DnsFailureTracker[$key]
+    $successes = $script:DnsSuccessTracker[$key]
     $totalTests = $failures + $successes
     
     # Check consecutive failures threshold
@@ -429,16 +685,16 @@ function Remove-FailingDnsProviders {
         # In aggressive mode, remove immediately on first failure
         if ($AggressiveMode) {
             $key = "$($dns.IP)|$($dns.Name)"
-            if ($global:DnsFailureTracker.ContainsKey($key) -and $global:DnsFailureTracker[$key] -gt 0 -and $global:DnsSuccessTracker[$key] -eq 0) {
-                $failures = $global:DnsFailureTracker[$key]
-                $successes = $global:DnsSuccessTracker[$key]
+            if ($script:DnsFailureTracker.ContainsKey($key) -and $script:DnsFailureTracker[$key] -gt 0 -and $script:DnsSuccessTracker[$key] -eq 0) {
+                $failures = $script:DnsFailureTracker[$key]
+                $successes = $script:DnsSuccessTracker[$key]
                 
                 # Update persistent tracking for this failure
                 if ($PersistentTracking) {
-                    Update-PersistentTracking -History $global:PersistentHistory -DnsIP $dns.IP -Failed $true
+                    Update-PersistentTracking -History $script:PersistentHistory -DnsIP $dns.IP -Failed $true
                 }
                 
-                $global:RemovedDnsProviders += [PSCustomObject]@{
+                $script:RemovedDnsProviders += [PSCustomObject]@{
                     Name = $dns.Name
                     IP = $dns.IP
                     Category = $dns.Category
@@ -459,17 +715,17 @@ function Remove-FailingDnsProviders {
         
         if ($shouldRemove) {
             $key = "$($dns.IP)|$($dns.Name)"
-            $failures = $global:DnsFailureTracker[$key]
-            $successes = $global:DnsSuccessTracker[$key]
+            $failures = $script:DnsFailureTracker[$key]
+            $successes = $script:DnsSuccessTracker[$key]
             $totalTests = $failures + $successes
             $failureRate = if ($totalTests -gt 0) { [math]::Round(($failures / $totalTests) * 100, 1) } else { 100 }
             
             # Update persistent tracking for this failure
             if (-not $DisablePersistentTracking) {
-                Update-PersistentTracking -History $global:PersistentHistory -DnsIP $dns.IP -Failed $true
+                Update-PersistentTracking -History $script:PersistentHistory -DnsIP $dns.IP -Failed $true
             }
             
-            $global:RemovedDnsProviders += [PSCustomObject]@{
+            $script:RemovedDnsProviders += [PSCustomObject]@{
                 Name = $dns.Name
                 IP = $dns.IP
                 Category = $dns.Category
@@ -490,106 +746,60 @@ function Remove-FailingDnsProviders {
     return $filteredProviders
 }
 
-# Define popular DNS providers including Egyptian ones
-$dnsProviders = @(    # ========== EGYPTIAN DNS PROVIDERS ==========
-    
-    # Working Egyptian DNS Servers (tested and verified)
-    @{ Name = "TE-Data Primary"; IP = "163.121.128.135"; Category = "Egyptian" },
-    @{ Name = "TE-Data Secondary"; IP = "163.121.128.134"; Category = "Egyptian" },
-    
-    # ========== GLOBAL DNS PROVIDERS ==========
-    
-    # Global DNS Providers (Updated with more options)
-    @{ Name = "Google DNS"; IP = "8.8.8.8"; Category = "Global" },
-    @{ Name = "Google DNS Secondary"; IP = "8.8.4.4"; Category = "Global" },
-    @{ Name = "Cloudflare DNS"; IP = "1.1.1.1"; Category = "Global" },
-    @{ Name = "Cloudflare DNS Secondary"; IP = "1.0.0.1"; Category = "Global" },
-    @{ Name = "Cloudflare Family"; IP = "1.1.1.3"; Category = "Global" },
-    @{ Name = "Cloudflare Family Secondary"; IP = "1.0.0.3"; Category = "Global" },
-    @{ Name = "Cloudflare for Teams"; IP = "1.1.1.2"; Category = "Global" },
-    @{ Name = "Cloudflare for Teams Alt"; IP = "1.0.0.2"; Category = "Global" },
-    @{ Name = "OpenDNS"; IP = "208.67.222.222"; Category = "Global" },
-    @{ Name = "OpenDNS Secondary"; IP = "208.67.220.220"; Category = "Global" },
-    @{ Name = "OpenDNS Family Shield"; IP = "208.67.222.123"; Category = "Global" },
-    @{ Name = "OpenDNS Family Shield 2"; IP = "208.67.220.123"; Category = "Global" },
-    @{ Name = "Quad9"; IP = "9.9.9.9"; Category = "Global" },
-    @{ Name = "Quad9 Secondary"; IP = "149.112.112.112"; Category = "Global" },
-    @{ Name = "Quad9 Secure"; IP = "9.9.9.11"; Category = "Global" },
-    @{ Name = "Quad9 Secure Secondary"; IP = "149.112.112.11"; Category = "Global" },
-    @{ Name = "Quad9 Unsecured"; IP = "9.9.9.10"; Category = "Global" },
-    @{ Name = "Quad9 Unsecured Alt"; IP = "149.112.112.10"; Category = "Global" },
-    @{ Name = "AdGuard DNS"; IP = "94.140.14.14"; Category = "Global" },
-    @{ Name = "AdGuard DNS Secondary"; IP = "94.140.15.15"; Category = "Global" },
-    @{ Name = "AdGuard Family"; IP = "94.140.14.15"; Category = "Global" },
-    @{ Name = "AdGuard Family Secondary"; IP = "94.140.15.16"; Category = "Global" },
-    @{ Name = "AdGuard Unfiltered"; IP = "94.140.14.140"; Category = "Global" },
-    @{ Name = "AdGuard Unfiltered Alt"; IP = "94.140.14.141"; Category = "Global" },
-    @{ Name = "CleanBrowsing"; IP = "185.228.168.9"; Category = "Global" },
-    @{ Name = "CleanBrowsing Secondary"; IP = "185.228.169.9"; Category = "Global" },
-    @{ Name = "CleanBrowsing Adult Filter"; IP = "185.228.168.10"; Category = "Global" },
-    @{ Name = "CleanBrowsing Adult Filter 2"; IP = "185.228.169.11"; Category = "Global" },
-    @{ Name = "CleanBrowsing Family"; IP = "185.228.168.168"; Category = "Global" },
-    @{ Name = "CleanBrowsing Family Alt"; IP = "185.228.169.168"; Category = "Global" },
-    @{ Name = "NextDNS"; IP = "45.90.28.167"; Category = "Global" },
-    @{ Name = "NextDNS Secondary"; IP = "45.90.30.167"; Category = "Global" },
-    @{ Name = "DNS.Watch"; IP = "84.200.69.80"; Category = "Global" },
-    @{ Name = "DNS.Watch Secondary"; IP = "84.200.70.40"; Category = "Global" },
-    @{ Name = "Comodo Secure DNS"; IP = "8.26.56.26"; Category = "Global" },
-    @{ Name = "Comodo Secure DNS 2"; IP = "8.20.247.20"; Category = "Global" },
-    @{ Name = "Level3 DNS"; IP = "4.2.2.1"; Category = "Global" },
-    @{ Name = "Level3 DNS Secondary"; IP = "4.2.2.2"; Category = "Global" },
-    @{ Name = "Level3 Alt 1"; IP = "4.2.2.3"; Category = "Global" },
-    @{ Name = "Level3 Alt 2"; IP = "4.2.2.4"; Category = "Global" },
-    @{ Name = "Verisign DNS"; IP = "64.6.64.6"; Category = "Global" },
-    @{ Name = "Verisign DNS Secondary"; IP = "64.6.65.6"; Category = "Global" },
-    
-    # Modern Fast DNS Providers
-    @{ Name = "Mullvad DNS"; IP = "194.242.2.2"; Category = "Global" },
-    @{ Name = "Mullvad DNS Alt"; IP = "193.19.108.2"; Category = "Global" },
-    @{ Name = "CIRA Canadian Shield"; IP = "149.112.121.10"; Category = "Global" },
-    @{ Name = "CIRA Canadian Shield Alt"; IP = "149.112.122.10"; Category = "Global" },
-    @{ Name = "LibreDNS"; IP = "116.202.176.26"; Category = "Global" },
-    @{ Name = "LibreDNS Alt"; IP = "95.216.229.153"; Category = "Global" },
-    @{ Name = "DeCloudUs DNS"; IP = "176.103.130.130"; Category = "Global" },
-    @{ Name = "DeCloudUs DNS Alt"; IP = "176.103.130.131"; Category = "Global" },
-    @{ Name = "puntCAT DNS"; IP = "109.69.8.51"; Category = "Global" },
-    @{ Name = "puntCAT DNS Alt"; IP = "109.69.8.52"; Category = "Global" },
-    @{ Name = "Digitale Gesellschaft"; IP = "185.95.218.42"; Category = "Global" },
-    @{ Name = "Digitale Gesellschaft Alt"; IP = "185.95.218.43"; Category = "Global" },
-    @{ Name = "Foundation for Applied Privacy"; IP = "146.255.56.98"; Category = "Global" },
-    @{ Name = "CZ.NIC ODVR"; IP = "193.17.47.1"; Category = "Global" },
-    @{ Name = "CZ.NIC ODVR Alt"; IP = "185.43.135.1"; Category = "Global" },
-    @{ Name = "BlahDNS Germany"; IP = "159.69.198.101"; Category = "Global" },
-    @{ Name = "BlahDNS Japan"; IP = "45.91.92.121"; Category = "Global" },
-    @{ Name = "BlahDNS Singapore"; IP = "194.145.240.6"; Category = "Global" },
-    @{ Name = "Snopyta DNS"; IP = "95.216.24.230"; Category = "Global" },
-    @{ Name = "Snopyta DNS Alt"; IP = "161.97.219.84"; Category = "Global" },
-    @{ Name = "AhaDNS Netherlands"; IP = "5.2.75.75"; Category = "Global" },
-    @{ Name = "AhaDNS Los Angeles"; IP = "45.67.219.208"; Category = "Global" },
-    @{ Name = "AhaDNS India"; IP = "45.79.120.233"; Category = "Global" },
-    @{ Name = "Namecheap DNS"; IP = "198.54.117.10"; Category = "Global" },
-    @{ Name = "Namecheap DNS Alt"; IP = "198.54.117.11"; Category = "Global" },
-    @{ Name = "Hurricane Electric"; IP = "74.82.42.42"; Category = "Global" },
-    @{ Name = "Alternate DNS"; IP = "76.76.19.19"; Category = "Global" },
-    @{ Name = "Alternate DNS 2"; IP = "76.223.100.101"; Category = "Global" },
-    @{ Name = "UncensoredDNS"; IP = "91.239.100.100"; Category = "Global" },
-    @{ Name = "UncensoredDNS Alt"; IP = "89.233.43.71"; Category = "Global" },
-    @{ Name = "Safe DNS"; IP = "195.46.39.39"; Category = "Global" },
-    @{ Name = "Safe DNS Alt"; IP = "195.46.39.40"; Category = "Global" },
-    @{ Name = "FreeDNS"; IP = "37.235.1.174"; Category = "Global" },
-    @{ Name = "FreeDNS Alt"; IP = "37.235.1.177"; Category = "Global" },
-    @{ Name = "Yandex DNS Basic"; IP = "77.88.8.8"; Category = "Global" },
-    @{ Name = "Yandex DNS Basic Alt"; IP = "77.88.8.1"; Category = "Global" },
-    @{ Name = "Yandex DNS Safe"; IP = "77.88.8.88"; Category = "Global" },
-    @{ Name = "Yandex DNS Family"; IP = "77.88.8.7"; Category = "Global" },
-    # Control D DNS Providers (moved to their own category)
-    @{ Name = "Control D Standard"; IP = "76.76.2.0"; Category = "ControlD" },
-    @{ Name = "Control D Standard Secondary"; IP = "76.76.10.0"; Category = "ControlD" },
-    @{ Name = "Control D Uncensored"; IP = "76.76.2.1"; Category = "ControlD" },
-    @{ Name = "Control D Uncensored Secondary"; IP = "76.76.10.1"; Category = "ControlD" },
-    @{ Name = "Control D Family"; IP = "76.76.2.3"; Category = "ControlD" },
-    @{ Name = "Control D Family Secondary"; IP = "76.76.10.3"; Category = "ControlD" }
-)
+# ============================================================================
+# DNS Provider Catalog
+# ============================================================================
+# Provider list is loaded from providers.json so the catalog can be tweaked
+# without touching the script. The inline fallback below is used only if the
+# JSON file is missing or unreadable.
+function Get-DNSProviderCatalog {
+    [CmdletBinding()]
+    param(
+        [string]$JsonPath = (Join-Path $PSScriptRoot 'providers.json')
+    )
+
+    if (Test-Path -LiteralPath $JsonPath) {
+        try {
+            $raw = Get-Content -LiteralPath $JsonPath -Raw -ErrorAction Stop
+            $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+            $list = $obj.providers
+            if (-not $list -or $list.Count -eq 0) {
+                throw "providers.json contained no entries"
+            }
+            return @($list | ForEach-Object {
+                $proto = if ($_.protocol) { $_.protocol.ToString().ToLower() } else { 'do53' }
+                @{
+                    Name     = $_.name
+                    IP       = $_.ip
+                    Category = $_.category
+                    Protocol = $proto
+                    Url      = if ($_.url)      { [string]$_.url }      else { '' }
+                    Hostname = if ($_.hostname) { [string]$_.hostname } else { '' }
+                }
+            })
+        } catch {
+            Write-Warning "Failed to load providers.json ($JsonPath): $_. Falling back to built-in catalog."
+        }
+    } else {
+        Write-Warning "providers.json not found at $JsonPath. Falling back to built-in catalog."
+    }
+
+    # Minimal hard-coded fallback catalog (kept intentionally small; full list
+    # lives in providers.json).
+    return @(
+        @{ Name = "Google DNS";              IP = "8.8.8.8";        Category = "Global"; Protocol = "do53"; Url = ""; Hostname = "" },
+        @{ Name = "Google DNS Secondary";    IP = "8.8.4.4";        Category = "Global"; Protocol = "do53"; Url = ""; Hostname = "" },
+        @{ Name = "Cloudflare DNS";          IP = "1.1.1.1";        Category = "Global"; Protocol = "do53"; Url = ""; Hostname = "" },
+        @{ Name = "Cloudflare DNS Secondary";IP = "1.0.0.1";        Category = "Global"; Protocol = "do53"; Url = ""; Hostname = "" },
+        @{ Name = "Quad9";                   IP = "9.9.9.9";        Category = "Global"; Protocol = "do53"; Url = ""; Hostname = "" },
+        @{ Name = "Quad9 Secondary";         IP = "149.112.112.112";Category = "Global"; Protocol = "do53"; Url = ""; Hostname = "" },
+        @{ Name = "OpenDNS";                 IP = "208.67.222.222"; Category = "Global"; Protocol = "do53"; Url = ""; Hostname = "" },
+        @{ Name = "OpenDNS Secondary";       IP = "208.67.220.220"; Category = "Global"; Protocol = "do53"; Url = ""; Hostname = "" }
+    )
+}
+
+$dnsProviders = Get-DNSProviderCatalog
+
 
 # Define domains and record types to resolve
 $testDomains = @($Domain)  # Default to the specified domain
@@ -660,8 +870,11 @@ function Write-ColoredMessage {
     param(
         [string]$Message,
         [string]$Color = "White",
-        [switch]$NoNewline
+        [switch]$NoNewline,
+        [switch]$Force
     )
+    # In -Quiet mode, suppress everything except messages tagged -Force.
+    if ($script:Quiet -and -not $Force) { return }
     try {
         if ($NoNewline) {
             Write-Host $Message -ForegroundColor $Color -NoNewline
@@ -672,6 +885,82 @@ function Write-ColoredMessage {
         # Fallback if colored output fails
         Write-Output $Message
     }
+}
+
+# ============================================================================
+# Structured logging (JSON-lines). One event per line, append-only. The log
+# is opt-in via -LogPath; calls are no-ops when not configured. Each record
+# carries an ISO-8601 UTC timestamp, the script run id, an event tag, and an
+# arbitrary payload hashtable.
+# ============================================================================
+$script:LogStreamWriter = $null
+$script:RunId = [Guid]::NewGuid().ToString('N').Substring(0, 12)
+
+function Initialize-StructuredLog {
+    param([string]$Path)
+    if (-not $Path) { return }
+    try {
+        # Resolve to an absolute path BEFORE handing to .NET - StreamWriter
+        # uses [Environment]::CurrentDirectory, not PowerShell's $PWD.
+        if (-not [System.IO.Path]::IsPathRooted($Path)) {
+            $Path = Join-Path (Get-Location).Path $Path
+        }
+        $dir = Split-Path -Path $Path -Parent
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force -WhatIf:$false -Confirm:$false | Out-Null
+        }
+        # Append mode (UTF-8, no BOM) so multiple runs can share a log.
+        $stream = [System.IO.StreamWriter]::new($Path, $true, [System.Text.UTF8Encoding]::new($false))
+        $stream.AutoFlush = $true
+        $script:LogStreamWriter = $stream
+    } catch {
+        Write-Warning "Failed to open log file '$Path': $_. Continuing without structured logging."
+        $script:LogStreamWriter = $null
+    }
+}
+
+function Write-StructuredLog {
+    param(
+        [Parameter(Mandatory)] [string]$Event,
+        [hashtable]$Data = @{}
+    )
+    if ($null -eq $script:LogStreamWriter) { return }
+    try {
+        $record = [ordered]@{
+            ts    = (Get-Date).ToUniversalTime().ToString('o')
+            run   = $script:RunId
+            event = $Event
+        }
+        foreach ($k in $Data.Keys) { $record[$k] = $Data[$k] }
+        $script:LogStreamWriter.WriteLine(($record | ConvertTo-Json -Compress -Depth 6))
+    } catch {
+        # Silently swallow logging failures - they must never break a test run.
+    }
+}
+
+function Close-StructuredLog {
+    if ($script:LogStreamWriter) {
+        try { $script:LogStreamWriter.Dispose() } catch { }
+        $script:LogStreamWriter = $null
+    }
+}
+
+# Open the log right away (no-op when -LogPath wasn't supplied) and emit a
+# run-start event recording the parameters that drove this invocation.
+Initialize-StructuredLog -Path $LogPath
+Write-StructuredLog -Event 'run-start' -Data @{
+    domain     = $Domain
+    category   = $Category
+    protocol   = $Protocol
+    testCount  = $TestCount
+    timeout    = $Timeout
+    parallel   = [bool]$Parallel
+    quickTest  = [bool]$QuickTest
+    maxThreads = $MaxThreads
+    mlProfile  = $MLProfile
+    quiet      = [bool]$Quiet
+    applyDns   = [bool]$ApplyDNS
+    pid        = $PID
 }
 
 # Function to test if network connectivity is available
@@ -703,7 +992,7 @@ function Test-IPv6Support {
     )
     
     try {
-        $resolveJob = Start-Job -ScriptBlock { 
+        $sb = {
             param($dnsIP, $domain)
             try {
                 $result = Resolve-DnsName -Server $dnsIP -Name $domain -Type AAAA -ErrorAction Stop
@@ -717,16 +1006,8 @@ function Test-IPv6Support {
             } catch {
                 return @{Success = $false; Error = $_.Exception.Message}
             }
-        } -ArgumentList $dnsIP, $domain
-        
-        if (Wait-Job $resolveJob -Timeout $timeout) {
-            $result = Receive-Job $resolveJob
-            Remove-Job $resolveJob -Force
-            return $result
-        } else {
-            Remove-Job $resolveJob -Force
-            return @{Success = $false; Error = "Timeout"}
         }
+        return Invoke-DnsScriptBlockWithTimeout -ScriptBlock $sb -ArgumentList @($dnsIP, $domain) -TimeoutSeconds $timeout
     } catch {
         return @{Success = $false; Error = $_.Exception.Message}
     }
@@ -739,49 +1020,53 @@ function Test-DNSSECSupport {
         [int]$timeout = 3
     )
     
-    # Test with a known DNSSEC-enabled domain
-    $dnssecDomain = "cloudflare.com"  # Known to have DNSSEC
+    # Real DNSSEC-validation test:
+    #   - dnssec-failed.org has a deliberately broken signature; a *validating*
+    #     resolver MUST return SERVFAIL (i.e. the resolve should fail).
+    #   - internetsociety.org is correctly signed; a validating resolver should
+    #     happily resolve it.
+    # A resolver is considered DNSSEC-validating only if BOTH conditions hold.
+    # Resolvers that just forward DNSKEY records but don't validate will return
+    # an answer for dnssec-failed.org, failing the negative canary.
     
     try {
-        $resolveJob = Start-Job -ScriptBlock { 
-            param($dnsIP, $domain)
-            try {
-                # Try to resolve and check for DNSSEC-related records
-                $result = Resolve-DnsName -Server $dnsIP -Name $domain -Type A -DnssecOk -ErrorAction Stop
-                
-                # Check if DNSSEC data is present (AD flag or RRSIG records)
-                $hasDnssec = $false
-                
-                # Check for authenticated data flag or RRSIG presence
-                if ($result) {
-                    # Try to get DNSKEY records as a DNSSEC indicator
-                    $dnskeyResult = Resolve-DnsName -Server $dnsIP -Name $domain -Type DNSKEY -ErrorAction SilentlyContinue
-                    $hasDnssec = ($null -ne $dnskeyResult)
-                }
-                
-                return @{
-                    Success = $true
-                    DNSSECSupported = $hasDnssec
-                    ValidationAttempted = $true
-                }
-            } catch {
-                # If the query fails, DNS might not support DNSSEC properly
-                return @{
-                    Success = $true
-                    DNSSECSupported = $false
-                    ValidationAttempted = $true
-                    Error = $_.Exception.Message
-                }
+        $sb = {
+            param($dnsIP)
+            $out = @{
+                BadResolved  = $null   # $true => resolver returned an answer (NOT validating)
+                BadSecure    = $null
+                GoodResolved = $null
+                GoodSecure   = $null
             }
-        } -ArgumentList $dnsIP, $dnssecDomain
-        
-        if (Wait-Job $resolveJob -Timeout $timeout) {
-            $result = Receive-Job $resolveJob
-            Remove-Job $resolveJob -Force
-            return $result
-        } else {
-            Remove-Job $resolveJob -Force
-            return @{Success = $false; DNSSECSupported = $false; ValidationAttempted = $false; Error = "Timeout"}
+            try {
+                $bad = Resolve-DnsName -Server $dnsIP -Name 'dnssec-failed.org' -Type A -DnssecOk -ErrorAction Stop
+                $out.BadResolved = ($null -ne $bad)
+                $out.BadSecure   = ($bad | Where-Object { $_.QueryType -eq 'A' -and $_.IPAddress }).Count -gt 0
+            } catch {
+                $out.BadResolved = $false
+            }
+            try {
+                $good = Resolve-DnsName -Server $dnsIP -Name 'internetsociety.org' -Type A -DnssecOk -ErrorAction Stop
+                $out.GoodResolved = ($null -ne $good)
+                $out.GoodSecure   = ($good | Where-Object { $_.QueryType -eq 'A' -and $_.IPAddress }).Count -gt 0
+            } catch {
+                $out.GoodResolved = $false
+            }
+            return $out
+        }
+
+        $r = Invoke-DnsScriptBlockWithTimeout -ScriptBlock $sb -ArgumentList @($dnsIP) -TimeoutSeconds $timeout
+        if ($r -and $r.ContainsKey('Error') -and $r.Error -eq 'Timeout') {
+            return @{ Success = $false; DNSSECSupported = $false; ValidationAttempted = $false; Error = 'Timeout' }
+        }
+        # Validating resolver: rejects bad-signature zone AND resolves good-signature zone
+        $isValidating = ((-not $r.BadSecure) -and $r.GoodSecure)
+        return @{
+            Success = $true
+            DNSSECSupported = $isValidating
+            ValidationAttempted = $true
+            BadZoneRejected = (-not $r.BadSecure)
+            GoodZoneResolved = $r.GoodSecure
         }
     } catch {
         return @{Success = $false; DNSSECSupported = $false; ValidationAttempted = $false; Error = $_.Exception.Message}
@@ -798,7 +1083,7 @@ function Test-ResponseQuality {
     )
     
     try {
-        $resolveJob = Start-Job -ScriptBlock { 
+        $sb = { 
             param($dnsIP, $domain, $recordType)
             try {
                 $result = Resolve-DnsName -Server $dnsIP -Name $domain -Type $recordType -ErrorAction Stop
@@ -846,16 +1131,8 @@ function Test-ResponseQuality {
             } catch {
                 return @{Success = $false; Error = $_.Exception.Message}
             }
-        } -ArgumentList $dnsIP, $domain, $recordType
-        
-        if (Wait-Job $resolveJob -Timeout $timeout) {
-            $result = Receive-Job $resolveJob
-            Remove-Job $resolveJob -Force
-            return $result
-        } else {
-            Remove-Job $resolveJob -Force
-            return @{Success = $false; Error = "Timeout"}
         }
+        return Invoke-DnsScriptBlockWithTimeout -ScriptBlock $sb -ArgumentList @($dnsIP, $domain, $recordType) -TimeoutSeconds $timeout
     } catch {
         return @{Success = $false; Error = $_.Exception.Message}
     }
@@ -873,7 +1150,7 @@ function Test-EDNS0Support {
         # EDNS0 allows for larger UDP packets (>512 bytes) and additional flags
         $testDomain = "google.com"
         
-        $resolveJob = Start-Job -ScriptBlock { 
+        $sb = { 
             param($dnsIP, $domain)
             try {
                 # PowerShell Resolve-DnsName uses EDNS0 by default, so we check for buffer size response
@@ -895,16 +1172,12 @@ function Test-EDNS0Support {
                     Error = $_.Exception.Message
                 }
             }
-        } -ArgumentList $dnsIP, $testDomain
-        
-        if (Wait-Job $resolveJob -Timeout $timeout) {
-            $result = Receive-Job $resolveJob
-            Remove-Job $resolveJob -Force
-            return $result
-        } else {
-            Remove-Job $resolveJob -Force
-            return @{Success = $false; EDNS0Supported = $false; Error = "Timeout"}
         }
+        $result = Invoke-DnsScriptBlockWithTimeout -ScriptBlock $sb -ArgumentList @($dnsIP, $testDomain) -TimeoutSeconds $timeout
+        if ($result -and $result.ContainsKey('Error') -and $result.Error -eq 'Timeout') {
+            return @{ Success = $false; EDNS0Supported = $false; Error = 'Timeout' }
+        }
+        return $result
     } catch {
         return @{Success = $false; EDNS0Supported = $false; Error = $_.Exception.Message}
     }
@@ -923,7 +1196,7 @@ function Test-TCPFallback {
         $testDomain = "google.com"
         $testType = "TXT"  # TXT records are often large
         
-        $resolveJob = Start-Job -ScriptBlock { 
+        $sb = { 
             param($dnsIP, $domain, $recordType)
             try {
                 # Request TXT records which can be large and may trigger TCP fallback
@@ -959,18 +1232,88 @@ function Test-TCPFallback {
                     }
                 }
             }
-        } -ArgumentList $dnsIP, $testDomain, $testType
-        
-        if (Wait-Job $resolveJob -Timeout $timeout) {
-            $result = Receive-Job $resolveJob
-            Remove-Job $resolveJob -Force
-            return $result
-        } else {
-            Remove-Job $resolveJob -Force
-            return @{Success = $false; TCPSupported = $false; Error = "Timeout"}
         }
+        $result = Invoke-DnsScriptBlockWithTimeout -ScriptBlock $sb -ArgumentList @($dnsIP, $testDomain, $testType) -TimeoutSeconds $timeout
+        if ($result -and $result.ContainsKey('Error') -and $result.Error -eq 'Timeout') {
+            return @{ Success = $false; TCPSupported = $false; Error = 'Timeout' }
+        }
+        return $result
     } catch {
         return @{Success = $false; TCPSupported = $false; Error = $_.Exception.Message}
+    }
+}
+
+# Function to test content filtering (malware / ads / adult) using canary domains.
+# A category is reported as "Blocked" when the resolver either returns NXDOMAIN /
+# refuses the query, or returns a sinkhole address (0.0.0.0, 127.0.0.0/8, or the
+# all-zeros AAAA ::). A category is reported as "Allowed" when a routable answer
+# is returned. A category is "N/A" if the canary lookup itself errors / times out.
+function Test-DNSFiltering {
+    param(
+        [string]$dnsIP,
+        [int]$timeout = 4
+    )
+
+    # Vendor-supplied canary domains where available; otherwise the most common
+    # block-listed real domains used by family / ad-blocking resolvers.
+    $canaries = @{
+        Malware = 'malware.testcategory.com'           # used by Cisco / OpenDNS family
+        Phishing = 'phishing.testcategory.com'
+        Ads     = 'doubleclick.net'                    # blocked by AdGuard / NextDNS / ControlD
+        Adult   = 'pornhub.com'                        # blocked by family / ControlD-Family
+    }
+
+    try {
+        $sb = {
+            param($dnsIP, $canaries)
+
+            function Test-IsSinkholeIP {
+                param([string]$ip)
+                if (-not $ip) { return $false }
+                if ($ip -eq '0.0.0.0' -or $ip -eq '::') { return $true }
+                if ($ip -match '^127\.') { return $true }
+                return $false
+            }
+
+            $out = @{}
+            foreach ($cat in $canaries.Keys) {
+                $domain = $canaries[$cat]
+                $entry = @{ Domain = $domain; Blocked = $false; Reason = $null; Resolved = $false }
+                try {
+                    $r = Resolve-DnsName -Server $dnsIP -Name $domain -Type A -ErrorAction Stop
+                    $ips = @($r | Where-Object { $_.IPAddress } | Select-Object -ExpandProperty IPAddress)
+                    if ($ips.Count -eq 0) {
+                        $entry.Blocked = $true
+                        $entry.Reason  = 'NoAnswer'
+                    } elseif (($ips | Where-Object { Test-IsSinkholeIP $_ }).Count -gt 0) {
+                        $entry.Blocked = $true
+                        $entry.Reason  = 'Sinkhole'
+                    } else {
+                        $entry.Resolved = $true
+                        $entry.Reason   = 'Allowed'
+                    }
+                } catch {
+                    # NXDOMAIN, REFUSED, etc. all surface as terminating errors here.
+                    $msg = $_.Exception.Message
+                    if ($msg -match 'DNS name does not exist|NXDOMAIN|Name does not exist') {
+                        $entry.Blocked = $true
+                        $entry.Reason  = 'NXDOMAIN'
+                    } else {
+                        $entry.Reason  = "Error: $msg"
+                    }
+                }
+                $out[$cat] = $entry
+            }
+            return $out
+        }
+
+        $r = Invoke-DnsScriptBlockWithTimeout -ScriptBlock $sb -ArgumentList @($dnsIP, $canaries) -TimeoutSeconds $timeout
+        if ($r -and $r.ContainsKey('Error') -and $r.Error -eq 'Timeout') {
+            return @{ Success = $false; Error = 'Timeout' }
+        }
+        return @{ Success = $true; Categories = $r }
+    } catch {
+        return @{ Success = $false; Error = $_.Exception.Message }
     }
 }
 
@@ -981,7 +1324,10 @@ function Test-DNS {
         [string]$domain,
         [string]$recordType = "A",
         [string]$category = "Global",
-        [string]$providerName = "Unknown"
+        [string]$providerName = "Unknown",
+        [string]$probeProtocol = "do53",
+        [string]$url = "",
+        [string]$hostname = ""
     )
 
     $responseTimes = @()
@@ -994,40 +1340,29 @@ function Test-DNS {
 
     # First do a single test to check reliability - also measure timing for jitter calculation
     try {
-        $startTime = Get-Date
-        $resolveJob = Start-Job -ScriptBlock { 
-            param($dnsIP, $domain, $recordType)
-            try {
-                Resolve-DnsName -Server $dnsIP -Name $domain -Type $recordType -ErrorAction Stop | Out-Null
-                return @{Success = $true}
-            } catch {
-                return @{Success = $false; Error = $_.Exception.Message}
-            }
-        } -ArgumentList $dnsIP, $domain, $recordType
-        
-        if (-not (Wait-Job $resolveJob -Timeout $currentTimeout)) {
-            Remove-Job $resolveJob -Force
+        $result = Invoke-DnsProbe -IP $dnsIP -Domain $domain -RecordType $recordType -ProbeProtocol $probeProtocol -Url $url -Hostname $hostname -TimeoutSeconds $currentTimeout
+        if ($result -and $result.Error -eq 'Timeout') {
             Write-ColoredMessage "Failed (timeout)" -Color Red
             Update-DnsTracker -DnsIP $dnsIP -ProviderName $providerName -Success $false
+            Write-StructuredLog -Event 'probe-failed' -Data @{ ip=$dnsIP; provider=$providerName; protocol=$probeProtocol; recordType=$recordType; domain=$domain; reason='timeout' }
             return @{Status = "Error"; ResponseTime = 0; Jitter = 0; RecordType = $recordType; Domain = $domain}
         }
-        
-        $result = Receive-Job $resolveJob
-        $endTime = Get-Date
-        Remove-Job $resolveJob -Force
-        
+
         if (-not $result.Success) {
             Write-ColoredMessage "Failed ($($result.Error))" -Color Red
             Update-DnsTracker -DnsIP $dnsIP -ProviderName $providerName -Success $false
+            Write-StructuredLog -Event 'probe-failed' -Data @{ ip=$dnsIP; provider=$providerName; protocol=$probeProtocol; recordType=$recordType; domain=$domain; reason=[string]$result.Error }
             return @{Status = "Error"; ResponseTime = 0; Jitter = 0; RecordType = $recordType; Domain = $domain}
         }
         
-        # Measure reliability test response time for jitter calculation
-        $reliabilityTime = ($endTime - $startTime).TotalMilliseconds
-        $responseTimes += $reliabilityTime
+        # Reliability probe doubles as a warm-up: it primes any local resolver
+        # state, so we deliberately exclude its timing from the jitter / median
+        # statistics. The probe itself still counts toward the success rate.
+        $reliabilityTime = [double]$result.ResponseTimeMs
     } catch {
         Write-ColoredMessage "Failed (error: $_)" -Color Red
         Update-DnsTracker -DnsIP $dnsIP -ProviderName $providerName -Success $false
+        Write-StructuredLog -Event 'probe-failed' -Data @{ ip=$dnsIP; provider=$providerName; protocol=$probeProtocol; recordType=$recordType; domain=$domain; reason="exception: $_" }
         return @{Status = "Error"; ResponseTime = 0; Jitter = 0; RecordType = $recordType; Domain = $domain}
     }
 
@@ -1053,32 +1388,39 @@ function Test-DNS {
                 Write-Progress @progressParams
             }
 
-            $startTime = Get-Date
-            $resolveJob = Start-Job -ScriptBlock { 
-                param($dnsIP, $domain, $recordType)
-                try {
-                    Resolve-DnsName -Server $dnsIP -Name $domain -Type $recordType -ErrorAction Stop | Out-Null
-                    return @{Success = $true}
-                } catch {
-                    return @{Success = $false; Error = $_.Exception.Message}
+            # Optionally bust the recursive-resolver cache so we measure a real
+            # upstream lookup rather than a sub-millisecond cache hit.
+            $probeDomain = if ($CacheBust) { Get-CacheBustingDomain -Domain $domain } else { $domain }
+
+            # Retry-with-backoff loop. Only timeouts trigger a retry; an explicit
+            # error response is treated as a hard failure (no retry).
+            $attempt = 0
+            $probeSucceeded = $false
+            $probeTime = 0.0
+            $attemptTimeout = $currentTimeout
+            while ($attempt -le $MaxRetries -and -not $probeSucceeded) {
+                $attempt++
+                $probeResult = Invoke-DnsProbe -IP $dnsIP -Domain $probeDomain -RecordType $recordType -ProbeProtocol $probeProtocol -Url $url -Hostname $hostname -TimeoutSeconds $attemptTimeout
+                $timedOut = ($probeResult -and $probeResult.Error -eq 'Timeout')
+                if (-not $timedOut -and $probeResult.Success) {
+                    $probeTime = [double]$probeResult.ResponseTimeMs
+                    $probeSucceeded = $true
                 }
-            } -ArgumentList $dnsIP, $domain, $recordType
-            
-            if (Wait-Job $resolveJob -Timeout $currentTimeout) {
-                $result = Receive-Job $resolveJob
-                if ($result.Success) {
-                    $endTime = Get-Date
-                    $responseTime = ($endTime - $startTime).TotalMilliseconds
-                    $responseTimes += $responseTime
-                    $successCount++
-                    Update-DnsTracker -DnsIP $dnsIP -ProviderName $providerName -Success $true
-                } else {
-                    Update-DnsTracker -DnsIP $dnsIP -ProviderName $providerName -Success $false
-                }
+
+                # Only timeouts justify a retry; an explicit DNS error (NXDOMAIN
+                # against a real domain, REFUSED, etc.) won't get faster on retry.
+                if (-not $timedOut) { break }
+                # Exponential backoff: 1.5x per attempt, capped at 2x base.
+                $attemptTimeout = [int][Math]::Min($attemptTimeout * 1.5, $currentTimeout * 2)
+            }
+
+            if ($probeSucceeded) {
+                $responseTimes += $probeTime
+                $successCount++
+                Update-DnsTracker -DnsIP $dnsIP -ProviderName $providerName -Success $true
             } else {
                 Update-DnsTracker -DnsIP $dnsIP -ProviderName $providerName -Success $false
             }
-            Remove-Job $resolveJob -Force -ErrorAction SilentlyContinue
         } catch {
             # Continue testing even if one test fails
             Update-DnsTracker -DnsIP $dnsIP -ProviderName $providerName -Success $false
@@ -1098,27 +1440,58 @@ function Test-DNS {
     if ($responseTimes.Count -eq 0) {
         $totalTests = $TestCount + 1
         $successRate = ($successCount / $totalTests) * 100
-        return @{Status = "Success"; ResponseTime = 0; Jitter = 0; RecordType = $recordType; Domain = $domain; SuccessRate = $successRate; ActualTimeout = $currentTimeout; IPv6Support = $null; DNSSECSupport = $null; ResponseQuality = $null}
+        return @{Status = "Success"; ResponseTime = 0; Jitter = 0; Median = 0; Mean = 0; StdDev = 0; P95 = 0; IQR = 0; SampleCount = 0; ReliabilityTime = $reliabilityTime; RecordType = $recordType; Domain = $domain; SuccessRate = $successRate; ActualTimeout = $currentTimeout; IPv6Support = $null; DNSSECSupport = $null; ResponseQuality = $null}
     }
     
-    # Calculate metrics
-    $averageTime = ($responseTimes | Measure-Object -Average).Average
-    $jitter = if ($responseTimes.Count -gt 1) {
-        $standardDeviation = [Math]::Sqrt(($responseTimes | ForEach-Object { [Math]::Pow($_ - $averageTime, 2) } | Measure-Object -Average).Average)
-        [Math]::Round($standardDeviation, 2)
-    } else {
-        0
-    }
-    
+    # Robust statistics on the performance-probe sample (the reliability/warm-up
+    # probe is intentionally excluded to avoid cold-cache bias).
+    $rtArray = [double[]]$responseTimes
+    $mean   = ($rtArray | Measure-Object -Average).Average
+    $median = Get-Percentile -Values $rtArray -Percentile 50
+    $p95    = Get-Percentile -Values $rtArray -Percentile 95
+    $q1     = Get-Percentile -Values $rtArray -Percentile 25
+    $q3     = Get-Percentile -Values $rtArray -Percentile 75
+    $iqr    = [Math]::Max(0, $q3 - $q1)
+
+    $stddev = if ($rtArray.Count -gt 1) {
+        [Math]::Sqrt(($rtArray | ForEach-Object { [Math]::Pow($_ - $mean, 2) } | Measure-Object -Average).Average)
+    } else { 0 }
+
+    # Headline metrics use the outlier-resistant median + IQR. Mean / std-dev /
+    # P95 are surfaced as additional fields for debugging and reporting.
+    $headlineRT     = [Math]::Round($median, 2)
+    $headlineJitter = [Math]::Round($iqr, 2)
+
     # Calculate success rate: total successful tests (reliability + performance) / total tests run
     # We ran 1 reliability test + $TestCount performance tests = ($TestCount + 1) total
     $totalTests = $TestCount + 1
     $successRate = ($successCount / $totalTests) * 100
-    
+
+    Write-StructuredLog -Event 'probe-result' -Data @{
+        ip          = $dnsIP
+        provider    = $providerName
+        protocol    = $probeProtocol
+        recordType  = $recordType
+        domain      = $domain
+        median      = [Math]::Round($median, 2)
+        mean        = [Math]::Round($mean, 2)
+        p95         = [Math]::Round($p95, 2)
+        iqr         = [Math]::Round($iqr, 2)
+        sampleCount = $rtArray.Count
+        successRate = $successRate
+    }
+
     return @{
         Status = "Success"
-        ResponseTime = [math]::Round($averageTime, 2)
-        Jitter = $jitter
+        ResponseTime = $headlineRT       # median (was mean)
+        Jitter = $headlineJitter         # IQR (was std-dev)
+        Median = $headlineRT
+        Mean = [Math]::Round($mean, 2)
+        StdDev = [Math]::Round($stddev, 2)
+        P95 = [Math]::Round($p95, 2)
+        IQR = $headlineJitter
+        SampleCount = $rtArray.Count
+        ReliabilityTime = [Math]::Round($reliabilityTime, 2)
         RecordType = $recordType
         SuccessRate = $successRate
         ActualTimeout = $currentTimeout
@@ -1130,27 +1503,27 @@ function Test-DNS {
 }
 
 # Load persistent tracking history
-$global:PersistentHistory = Initialize-PersistentTracking
+$script:PersistentHistory = Initialize-PersistentTracking
 
 # Handle reset tracking request
 if ($ResetTracking) {
-    if (Test-Path $global:PersistentTrackingFile) {
-        Remove-Item $global:PersistentTrackingFile -Force
+    if (Test-Path $script:PersistentTrackingFile) {
+        Remove-Item $script:PersistentTrackingFile -Force
         Write-ColoredMessage "Persistent tracking history has been reset." -Color Green
-        $global:PersistentHistory = @{}
+        $script:PersistentHistory = @{}
     } else {
         Write-ColoredMessage "No tracking history to reset." -Color Yellow
     }
     
     if ($ShowTrackingStats) {
-        Show-TrackingStatistics -History $global:PersistentHistory
+        Show-TrackingStatistics -History $script:PersistentHistory
     }
     exit 0
 }
 
 # Show tracking stats if requested
 if ($ShowTrackingStats) {
-    Show-TrackingStatistics -History $global:PersistentHistory
+    Show-TrackingStatistics -History $script:PersistentHistory
     if (-not $PSBoundParameters.ContainsKey('Domain')) {
         # Exit if only showing stats
         exit 0
@@ -1161,7 +1534,7 @@ if ($ShowTrackingStats) {
 Clear-Host
 
 # Start timing
-$global:TestStartTime = Get-Date
+$script:TestStartTime = Get-Date
 
 Write-ColoredMessage "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -Color Cyan
 Write-ColoredMessage "DNS Benchmark" -Color Cyan -NoNewline
@@ -1210,15 +1583,43 @@ if (-not (Test-NetworkConnectivity)) {
 
 # Reset in-memory failure trackers for this test run
 # (Persistent tracking in JSON file is maintained separately)
-$global:DnsFailureTracker = @{}
-$global:DnsSuccessTracker = @{}
-$global:RemovedDnsProviders = @()
+$script:DnsFailureTracker = @{}
+$script:DnsSuccessTracker = @{}
+$script:RemovedDnsProviders = @()
 
 # Filter DNS providers by category
 $filteredDnsProviders = if ($Category -eq "All") {
     $dnsProviders 
 } else { 
     $dnsProviders | Where-Object { $_.Category -eq $Category } 
+}
+
+# Protocol filter (Do53 / DoH / DoT). Default 'All' keeps every entry.
+if ($Protocol -ne 'All') {
+    $protoLower = $Protocol.ToLower()
+    $filteredDnsProviders = $filteredDnsProviders | Where-Object { $_.Protocol -eq $protoLower }
+}
+
+# If the encrypted-DNS module didn't load, drop DoH/DoT entries with a notice
+# rather than letting them all fail.
+if (-not $script:EncryptedDnsAvailable) {
+    $beforeProtoCount = ($filteredDnsProviders | Measure-Object).Count
+    $filteredDnsProviders = $filteredDnsProviders | Where-Object { $_.Protocol -ne 'doh' -and $_.Protocol -ne 'dot' }
+    $droppedProto = $beforeProtoCount - ($filteredDnsProviders | Measure-Object).Count
+    if ($droppedProto -gt 0) {
+        Write-ColoredMessage "Dropped $droppedProto DoH/DoT provider(s) - DnsWireProtocol module not loaded." -Color Yellow
+    }
+}
+
+# Parallel mode currently only supports Do53 (the inline worker doesn't ship
+# the wire-protocol module into runspaces). Skip encrypted entries with a notice.
+if ($Parallel) {
+    $beforeParCount = ($filteredDnsProviders | Measure-Object).Count
+    $filteredDnsProviders = $filteredDnsProviders | Where-Object { $_.Protocol -eq 'do53' }
+    $droppedPar = $beforeParCount - ($filteredDnsProviders | Measure-Object).Count
+    if ($droppedPar -gt 0) {
+        Write-ColoredMessage "Skipping $droppedPar DoH/DoT provider(s) in -Parallel mode (run sequentially to test those)." -Color Yellow
+    }
 }
 
 if ($filteredDnsProviders.Count -eq 0) {
@@ -1228,7 +1629,7 @@ if ($filteredDnsProviders.Count -eq 0) {
 
 # Filter out blacklisted DNS providers
 if (-not $DisablePersistentTracking) {
-    $blacklistedIPs = Get-BlacklistedDNS -History $global:PersistentHistory
+    $blacklistedIPs = Get-BlacklistedDNS -History $script:PersistentHistory
     
     if ($blacklistedIPs.Count -gt 0) {
         Write-ColoredMessage "`nFiltering out $($blacklistedIPs.Count) blacklisted DNS server(s) from history..." -Color Yellow
@@ -1251,10 +1652,10 @@ if ($filteredDnsProviders.Count -eq 0) {
 }
 
 # ML-based prioritization: Test best-performing DNS servers first
-if ($global:MLEnabled -and $global:MLData.Servers.Count -gt 0) {
-    Write-ColoredMessage "ML Optimization: Prioritizing top-performing DNS servers from $($global:MLData.TotalRuns) historical runs..." -Color Cyan
+if ($script:MLEnabled -and $script:MLData.Servers.Count -gt 0) {
+    Write-ColoredMessage "ML Optimization: Prioritizing top-performing DNS servers from $($script:MLData.TotalRuns) historical runs..." -Color Cyan
     
-    $filteredDnsProviders = Get-PrioritizedServers -AllServers $filteredDnsProviders -MLData $global:MLData
+    $filteredDnsProviders = Get-PrioritizedServers -AllServers $filteredDnsProviders -MLData $script:MLData
     
     if ($QuickTest) {
         $exitStatus = if ($NoEarlyExit) { "early exit DISABLED" } else { "early exit enabled" }
@@ -1262,20 +1663,20 @@ if ($global:MLEnabled -and $global:MLData.Servers.Count -gt 0) {
     }
     
     # Show ML recommendation if available
-    $mlRecommendation = Get-MLRecommendedPair -MLData $global:MLData -PreferredType "Best Overall"
+    $mlRecommendation = Get-MLRecommendedPair -MLData $script:MLData -PreferredType "Best Overall"
     if ($mlRecommendation) {
         Write-ColoredMessage "ML Recommended Pair: $($mlRecommendation.PrimaryProvider) ($($mlRecommendation.PrimaryIP)) + $($mlRecommendation.SecondaryProvider) ($($mlRecommendation.SecondaryIP))" -Color Green
         Write-ColoredMessage "  Based on $($mlRecommendation.TestCount) tests, Avg Score: $([Math]::Round($mlRecommendation.AverageScore, 2))" -Color Green
     }
 }
 # QuickTest optimization: Sort DNS providers by historical success (fallback if ML not available)
-elseif ($QuickTest -and -not $DisablePersistentTracking -and $global:PersistentHistory.Keys.Count -gt 0) {
+elseif ($QuickTest -and -not $DisablePersistentTracking -and $script:PersistentHistory.Keys.Count -gt 0) {
     Write-ColoredMessage "QuickTest: Prioritizing historically reliable DNS servers..." -Color Cyan
     
     $filteredDnsProviders = $filteredDnsProviders | Sort-Object {
         $ip = $_.IP
-        if ($global:PersistentHistory.ContainsKey($ip)) {
-            $record = $global:PersistentHistory[$ip]
+        if ($script:PersistentHistory.ContainsKey($ip)) {
+            $record = $script:PersistentHistory[$ip]
             # Calculate reliability score (lower is better for sorting)
             # Prioritize: high success count, low failure count
             if ($record.TotalRuns -gt 0) {
@@ -1312,8 +1713,26 @@ $results = @()
 
 # Test each DNS provider
 if ($Parallel) {
-    Write-ColoredMessage "`nRunning tests in parallel mode (faster but less precise timing)" -Color Yellow
-    
+    Write-ColoredMessage "`nRunning tests in parallel mode (faster but less precise timing) - MaxThreads=$MaxThreads" -Color Yellow
+
+    # Prefer Start-ThreadJob (in-process, ~50x cheaper to spin up than Start-Job
+    # which forks a fresh powershell.exe per call). On Windows PowerShell 5.1
+    # the ThreadJob module is shipped via the gallery; ensure it's loaded if
+    # available, fall back to Start-Job if not.
+    $useThreadJob = $false
+    if (Get-Command Start-ThreadJob -ErrorAction SilentlyContinue) {
+        $useThreadJob = $true
+    } elseif (Get-Module -ListAvailable -Name ThreadJob) {
+        try {
+            Import-Module ThreadJob -ErrorAction Stop
+            $useThreadJob = $true
+        } catch {
+            Write-Warning "ThreadJob module present but failed to import: $_. Falling back to Start-Job."
+        }
+    } else {
+        Write-Warning "ThreadJob module not found. Install with: Install-Module ThreadJob -Scope CurrentUser. Falling back to Start-Job (much slower)."
+    }
+
     try {
         # Create job script block for each DNS provider and record type
         $jobs = @()
@@ -1349,30 +1768,12 @@ if ($Parallel) {
 
                         $responseTimes = @()
                         $successCount = 0
-                        
-                        # Reliability test
+
+                        # Reliability test (no nested job - relies on Resolve-DnsName's
+                        # built-in DNS-client timeout, which is sufficient for parallel
+                        # mode where wall-clock per-probe slop is acceptable).
                         try {
-                            $resolveJob = Start-Job -ScriptBlock { 
-                                param($dnsIP, $domain, $recordType)
-                                try {
-                                    Resolve-DnsName -Server $dnsIP -Name $domain -Type $recordType -ErrorAction Stop | Out-Null
-                                    return @{Success = $true}
-                                } catch {
-                                    return @{Success = $false; Error = $_.Exception.Message}
-                                }
-                            } -ArgumentList $dnsIP, $domain, $recordType
-                            
-                            if (-not (Wait-Job $resolveJob -Timeout $timeout)) {
-                                Remove-Job $resolveJob -Force
-                                return @{Status = "Error"; ResponseTime = 0; Jitter = 0; RecordType = $recordType}
-                            }
-                            
-                            $result = Receive-Job $resolveJob
-                            Remove-Job $resolveJob -Force
-                            
-                            if (-not $result.Success) {
-                                return @{Status = "Error"; ResponseTime = 0; Jitter = 0; RecordType = $recordType}
-                            }
+                            Resolve-DnsName -Server $dnsIP -Name $domain -Type $recordType -DnsOnly -ErrorAction Stop | Out-Null
                         } catch {
                             return @{Status = "Error"; ResponseTime = 0; Jitter = 0; RecordType = $recordType}
                         }
@@ -1381,31 +1782,15 @@ if ($Parallel) {
                         for ($i = 1; $i -le $testCount; $i++) {
                             try {
                                 $startTime = Get-Date
-                                $resolveJob = Start-Job -ScriptBlock { 
-                                    param($dnsIP, $domain, $recordType)
-                                    try {
-                                        Resolve-DnsName -Server $dnsIP -Name $domain -Type $recordType -ErrorAction Stop | Out-Null
-                                        return @{Success = $true}
-                                    } catch {
-                                        return @{Success = $false; Error = $_.Exception.Message}
-                                    }
-                                } -ArgumentList $dnsIP, $domain, $recordType
-                                
-                                if (Wait-Job $resolveJob -Timeout $timeout) {
-                                    $result = Receive-Job $resolveJob
-                                    if ($result.Success) {
-                                        $endTime = Get-Date
-                                        $responseTime = ($endTime - $startTime).TotalMilliseconds
-                                        $responseTimes += $responseTime
-                                        $successCount++
-                                    }
-                                }
-                                Remove-Job $resolveJob -Force -ErrorAction SilentlyContinue
+                                Resolve-DnsName -Server $dnsIP -Name $domain -Type $recordType -DnsOnly -ErrorAction Stop | Out-Null
+                                $endTime = Get-Date
+                                $responseTimes += ($endTime - $startTime).TotalMilliseconds
+                                $successCount++
                             } catch {
                                 continue
                             }
                         }
-                        
+
                         if ($successCount -eq 0) {
                             return @{Status = "Error"; ResponseTime = 0; Jitter = 0; RecordType = $recordType}
                         }
@@ -1443,8 +1828,12 @@ if ($Parallel) {
                     }
                 }
                 
-                # Start the job
-                $job = Start-Job -ScriptBlock $jobScriptBlock -ArgumentList $dns, $testDomain, $recordType, $Timeout, $TestCount
+                # Start the job (ThreadJob if available, fall back to Start-Job)
+                if ($useThreadJob) {
+                    $job = Start-ThreadJob -ScriptBlock $jobScriptBlock -ArgumentList $dns, $testDomain, $recordType, $Timeout, $TestCount -ThrottleLimit $MaxThreads
+                } else {
+                    $job = Start-Job -ScriptBlock $jobScriptBlock -ArgumentList $dns, $testDomain, $recordType, $Timeout, $TestCount
+                }
                 $jobs += @{Job = $job; DNS = $dns; RecordType = $recordType}
             }
         }
@@ -1530,7 +1919,7 @@ if (-not $Parallel) {
             }
             
             foreach ($recordType in $recordTypes) {
-                $result = Test-DNS -dnsIP $dns.IP -domain $testDomain -recordType $recordType -category $dns.Category -providerName $dns.Name
+                $result = Test-DNS -dnsIP $dns.IP -domain $testDomain -recordType $recordType -category $dns.Category -providerName $dns.Name -probeProtocol $dns.Protocol -url $dns.Url -hostname $dns.Hostname
                 
                 # Show compact status
                 if ($result.Status -eq "Success") {
@@ -1539,50 +1928,67 @@ if (-not $Parallel) {
                     Write-Host "✗" -NoNewline -ForegroundColor Red
                 }
                 
-                # Run additional tests if enabled and main test succeeded
-                if ($result.Status -eq "Success") {
-                    # Test IPv6 support
-                    if (-not $SkipIPv6Test) {
-                        $ipv6Test = Test-IPv6Support -dnsIP $dns.IP -domain $testDomain -timeout $result.ActualTimeout
-                        $result.IPv6Support = $ipv6Test.Success
+                # Capability tests are run independently of the A-record probe
+                # so we still get an IPv6/DNSSEC/EDNS0/TCP capability matrix
+                # for resolvers that are slow or have flaky A-record performance.
+                $capTimeout = if ($result.ActualTimeout) { $result.ActualTimeout } else { $Timeout }
+
+                # Test IPv6 support
+                if (-not $SkipIPv6Test) {
+                    $ipv6Test = Test-IPv6Support -dnsIP $dns.IP -domain $testDomain -timeout $capTimeout
+                    $result.IPv6Support = $ipv6Test.Success
+                }
+
+                # Test DNSSEC support (only once per DNS, not per domain/record)
+                if (-not $SkipDNSSECTest -and $null -eq $result.DNSSECSupport) {
+                    $dnssecTest = Test-DNSSECSupport -dnsIP $dns.IP -timeout $capTimeout
+                    $result.DNSSECSupport = $dnssecTest.DNSSECSupported
+                }
+
+                # Verify response quality (skip if main probe didn't succeed -
+                # the underlying record likely won't resolve either)
+                if (-not $SkipResponseVerification -and $result.Status -eq "Success") {
+                    $qualityTest = Test-ResponseQuality -dnsIP $dns.IP -domain $testDomain -recordType $recordType -timeout $capTimeout
+                    if ($qualityTest.Success) {
+                        $result.ResponseQuality = $qualityTest.Quality.IsComplete
                     }
-                    
-                    # Test DNSSEC support (only once per DNS, not per domain/record)
-                    if (-not $SkipDNSSECTest -and $null -eq $result.DNSSECSupport) {
-                        $dnssecTest = Test-DNSSECSupport -dnsIP $dns.IP -timeout $result.ActualTimeout
-                        $result.DNSSECSupport = $dnssecTest.DNSSECSupported
-                    }
-                    
-                    # Verify response quality
-                    if (-not $SkipResponseVerification) {
-                        $qualityTest = Test-ResponseQuality -dnsIP $dns.IP -domain $testDomain -recordType $recordType -timeout $result.ActualTimeout
-                        if ($qualityTest.Success) {
-                            $result.ResponseQuality = $qualityTest.Quality.IsComplete
-                        }
-                    }
-                    
-                    # Test EDNS0 support (only once per DNS)
-                    if ($TestEDNS0 -and $null -eq $result.EDNS0Support) {
-                        $edns0Test = Test-EDNS0Support -dnsIP $dns.IP -timeout $result.ActualTimeout
-                        $result.EDNS0Support = $edns0Test.EDNS0Supported
-                    }
-                    
-                    # Test TCP fallback support (only once per DNS)
-                    if ($TestTCP -and $null -eq $result.TCPSupport) {
-                        $tcpTest = Test-TCPFallback -dnsIP $dns.IP -timeout $result.ActualTimeout
-                        $result.TCPSupport = $tcpTest.TCPSupported
+                }
+
+                # Test EDNS0 support (only once per DNS)
+                if ($TestEDNS0 -and $null -eq $result.EDNS0Support) {
+                    $edns0Test = Test-EDNS0Support -dnsIP $dns.IP -timeout $capTimeout
+                    $result.EDNS0Support = $edns0Test.EDNS0Supported
+                }
+
+                # Test TCP fallback support (only once per DNS)
+                if ($TestTCP -and $null -eq $result.TCPSupport) {
+                    $tcpTest = Test-TCPFallback -dnsIP $dns.IP -timeout $capTimeout
+                    $result.TCPSupport = $tcpTest.TCPSupported
+                }
+
+                # Test content filtering (only once per DNS)
+                if ($TestFiltering -and $null -eq $result.Filtering) {
+                    $filterTest = Test-DNSFiltering -dnsIP $dns.IP -timeout ([Math]::Max($capTimeout, 4))
+                    if ($filterTest.Success) {
+                        $result.Filtering = $filterTest.Categories
                     }
                 }
                 
                 # Update persistent tracking
                 if (-not $DisablePersistentTracking) {
                     $failed = ($result.Status -eq "Error")
-                    Update-PersistentTracking -History $global:PersistentHistory -DnsIP $dns.IP -Failed $failed
+                    Update-PersistentTracking -History $script:PersistentHistory -DnsIP $dns.IP -Failed $failed
                 }
                 
                 # Update ML training data
-                if ($global:MLEnabled -and $result.Status -eq "Success") {
-                    Update-ServerMLData -MLData $global:MLData `
+                if ($script:MLEnabled -and $result.Status -eq "Success") {
+                    $filteringSeen = $false
+                    if ($result.Filtering) {
+                        foreach ($cat in $result.Filtering.Values) {
+                            if ($cat.Blocked) { $filteringSeen = $true; break }
+                        }
+                    }
+                    Update-ServerMLData -MLData $script:MLData `
                         -IP $dns.IP `
                         -Provider $dns.Name `
                         -ResponseTime $result.ResponseTime `
@@ -1591,7 +1997,10 @@ if (-not $Parallel) {
                         -Category $dns.Category `
                         -IPv6Support ($result.IPv6Support -eq $true) `
                         -DNSSECSupport ($result.DNSSECSupport -eq $true) `
-                        -QualityCheck ($result.ResponseQuality -eq $true)
+                        -QualityCheck ($result.ResponseQuality -eq $true) `
+                        -EDNS0Support ($result.EDNS0Support -eq $true) `
+                        -TCPSupport ($result.TCPSupport -eq $true) `
+                        -FilteringSupport $filteringSeen
                 }
                 
                 $results += [PSCustomObject]@{
@@ -1602,6 +2011,10 @@ if (-not $Parallel) {
                     ResponseTime = if ($result.Status -eq "Error") { "Timeout" } else { "$($result.ResponseTime) ms" }
                     Status = $result.Status
                     Jitter = if ($result.Status -eq "Error") { "N/A" } else { "$($result.Jitter) ms" }
+                    Mean = if ($result.Status -eq "Error") { "N/A" } else { "$($result.Mean) ms" }
+                    StdDev = if ($result.Status -eq "Error") { "N/A" } else { "$($result.StdDev) ms" }
+                    P95 = if ($result.Status -eq "Error") { "N/A" } else { "$($result.P95) ms" }
+                    SampleCount = if ($result.Status -eq "Error") { 0 } else { $result.SampleCount }
                     RecordType = $result.RecordType
                     SuccessRate = if ($result.Status -eq "Error") { 0 } else { $result.SuccessRate }
                     IPv6 = if ($null -eq $result.IPv6Support) { "N/A" } elseif ($result.IPv6Support) { "✓" } else { "✗" }
@@ -1609,6 +2022,9 @@ if (-not $Parallel) {
                     Quality = if ($null -eq $result.ResponseQuality) { "N/A" } elseif ($result.ResponseQuality) { "✓" } else { "✗" }
                     EDNS0 = if ($null -eq $result.EDNS0Support) { "N/A" } elseif ($result.EDNS0Support) { "✓" } else { "✗" }
                     TCP = if ($null -eq $result.TCPSupport) { "N/A" } elseif ($result.TCPSupport) { "✓" } else { "✗" }
+                    BlocksMalware = if ($null -eq $result.Filtering) { "N/A" } elseif ($result.Filtering.Malware.Blocked) { "✓" } else { "✗" }
+                    BlocksAds = if ($null -eq $result.Filtering) { "N/A" } elseif ($result.Filtering.Ads.Blocked) { "✓" } else { "✗" }
+                    BlocksAdult = if ($null -eq $result.Filtering) { "N/A" } elseif ($result.Filtering.Adult.Blocked) { "✓" } else { "✗" }
                 }
             }
         }
@@ -1647,24 +2063,24 @@ if (-not $Parallel) {
                 $key = "$($dns.IP)|$($dns.Name)"
                 # In aggressive mode, require at least 2 failures before removal (not just 1)
                 # This prevents false positives from single network hiccups
-                if ($global:DnsFailureTracker.ContainsKey($key) -and $global:DnsFailureTracker[$key] -ge 2 -and $global:DnsSuccessTracker[$key] -eq 0) {
+                if ($script:DnsFailureTracker.ContainsKey($key) -and $script:DnsFailureTracker[$key] -ge 2 -and $script:DnsSuccessTracker[$key] -eq 0) {
                     $shouldRemoveThis = $true
                 }
             }
             
             if ($shouldRemoveThis) {
                 $key = "$($dns.IP)|$($dns.Name)"
-                $failures = if ($global:DnsFailureTracker.ContainsKey($key)) { $global:DnsFailureTracker[$key] } else { 0 }
-                $successes = if ($global:DnsSuccessTracker.ContainsKey($key)) { $global:DnsSuccessTracker[$key] } else { 0 }
+                $failures = if ($script:DnsFailureTracker.ContainsKey($key)) { $script:DnsFailureTracker[$key] } else { 0 }
+                $successes = if ($script:DnsSuccessTracker.ContainsKey($key)) { $script:DnsSuccessTracker[$key] } else { 0 }
                 $totalTests = $failures + $successes
                 $failureRate = if ($totalTests -gt 0) { [math]::Round(($failures / $totalTests) * 100, 1) } else { 100 }
                 
                 # Update persistent tracking for this failure
                 if (-not $DisablePersistentTracking) {
-                    Update-PersistentTracking -History $global:PersistentHistory -DnsIP $dns.IP -Failed $true
+                    Update-PersistentTracking -History $script:PersistentHistory -DnsIP $dns.IP -Failed $true
                 }
                 
-                $global:RemovedDnsProviders += [PSCustomObject]@{
+                $script:RemovedDnsProviders += [PSCustomObject]@{
                     Name = $dns.Name
                     IP = $dns.IP
                     Category = $dns.Category
@@ -1745,7 +2161,7 @@ function Remove-CompletelyFailedDNS {
         
         # Add to global removed providers list
         foreach ($removed in $removedProviders) {
-            $global:RemovedDnsProviders += [PSCustomObject]@{
+            $script:RemovedDnsProviders += [PSCustomObject]@{
                 Name = $removed.Name
                 IP = $removed.IP
                 Category = $removed.Category
@@ -2270,6 +2686,56 @@ function Get-LowLatencyPair {
     }
 }
 
+function Get-LowestJitterPair {
+    <#
+    .SYNOPSIS
+    Gets the DNS pair with lowest jitter (most stable/consistent)
+    #>
+    param (
+        [Array]$DNSResults,
+        [string]$RecordType = "A"
+    )
+    
+    $filteredResults = $DNSResults | Where-Object { 
+        $_.Status -eq "Success" -and $_.RecordType -eq $RecordType
+    }
+    
+    if ($filteredResults.Count -eq 0) {
+        return $null
+    }
+    
+    $scoredDNS = $filteredResults | ForEach-Object {
+        $jitter = if ($_.Jitter -eq "N/A") { [double]::MaxValue } else { [double]($_.Jitter -replace ' ms$', '') }
+        $responseTime = [double]($_.ResponseTime -replace ' ms$', '')
+        
+        [PSCustomObject]@{
+            Provider = $_.Provider
+            IP = $_.IP
+            ResponseTime = "$responseTime ms"
+            Jitter = $_.Jitter
+            NumericJitter = $jitter
+            SuccessRate = $_.SuccessRate
+            Category = $_.Category
+        }
+    } | Sort-Object NumericJitter
+    
+    $primary = $scoredDNS | Select-Object -First 1
+    $secondary = $scoredDNS | 
+        Where-Object { $_.IP -ne $primary.IP } |
+        Select-Object -First 1
+    
+    if (-not $secondary) {
+        $secondary = $primary
+    }
+    
+    return @{
+        Primary = $primary
+        Secondary = $secondary
+        Type = "Lowest Jitter"
+        AverageJitter = ($primary.NumericJitter + $secondary.NumericJitter) / 2
+    }
+}
+
 function Get-BestSameProviderPair {
     <#
     .SYNOPSIS
@@ -2522,7 +2988,7 @@ foreach ($recordType in $recordTypes) {
     $bestOverallPair = Get-BestOverallPair -DNSResults $results -RecordType $recordType -UseCompositeScore $true -JitterWeight $JitterWeight
     $mostReliablePair = Get-MostReliablePair -DNSResults $results -RecordType $recordType
     $lowLatencyPair = Get-LowLatencyPair -DNSResults $results -RecordType $recordType
-    $bestSameProviderPair = Get-BestSameProviderPair -DNSResults $results -RecordType $recordType -UseCompositeScore $true -JitterWeight $JitterWeight
+    $lowestJitterPair = Get-LowestJitterPair -DNSResults $results -RecordType $recordType
     $bestSameProviderPairGlobal = Get-BestSameProviderPairGlobal -DNSResults $results -RecordType $recordType -UseCompositeScore $true -JitterWeight $JitterWeight
     
     # Display all pairing options
@@ -2738,44 +3204,39 @@ foreach ($recordType in $recordTypes) {
         Write-ColoredMessage "    No valid DNS found" -Color Red
     }
     
-    # Option 7: Best Same Provider Pair
-    Write-ColoredMessage "`n[7] Best Same-Provider Configuration (Any):" -Color Yellow
-    if ($bestSameProviderPair) {
-        Write-Host "    Provider:  " -NoNewline -ForegroundColor White
-        Write-Host "$($bestSameProviderPair.ProviderName)" -ForegroundColor Magenta
-        
+    # Option 7: Lowest Jitter
+    Write-ColoredMessage "`n[7] Lowest Jitter Configuration (Most Stable):" -Color Yellow
+    if ($lowestJitterPair) {
         Write-Host "    Primary:   " -NoNewline -ForegroundColor White
-        Write-Host "$($bestSameProviderPair.Primary.IP)" -NoNewline -ForegroundColor Cyan
+        Write-Host "$($lowestJitterPair.Primary.IP)" -NoNewline -ForegroundColor Cyan
         Write-Host " (" -NoNewline -ForegroundColor DarkGray
-        Write-Host "$($bestSameProviderPair.Primary.Provider)" -NoNewline -ForegroundColor Magenta
+        Write-Host "$($lowestJitterPair.Primary.Provider)" -NoNewline -ForegroundColor Magenta
         Write-Host ") - " -NoNewline -ForegroundColor DarkGray
-        Write-Host "$($bestSameProviderPair.Primary.ResponseTime)" -NoNewline -ForegroundColor Green
+        Write-Host "$($lowestJitterPair.Primary.ResponseTime)" -NoNewline -ForegroundColor Green
         Write-Host " (Jitter: " -NoNewline -ForegroundColor DarkGray
-        Write-Host "$($bestSameProviderPair.Primary.Jitter)" -NoNewline -ForegroundColor Yellow
+        Write-Host "$($lowestJitterPair.Primary.Jitter)" -NoNewline -ForegroundColor Yellow
         Write-Host ") [" -NoNewline -ForegroundColor DarkGray
-        Write-Host "$($bestSameProviderPair.Primary.Category)" -NoNewline -ForegroundColor Blue
+        Write-Host "$($lowestJitterPair.Primary.Category)" -NoNewline -ForegroundColor Blue
         Write-Host "]" -ForegroundColor DarkGray
         
         Write-Host "    Secondary: " -NoNewline -ForegroundColor White
-        Write-Host "$($bestSameProviderPair.Secondary.IP)" -NoNewline -ForegroundColor Cyan
+        Write-Host "$($lowestJitterPair.Secondary.IP)" -NoNewline -ForegroundColor Cyan
         Write-Host " (" -NoNewline -ForegroundColor DarkGray
-        Write-Host "$($bestSameProviderPair.Secondary.Provider)" -NoNewline -ForegroundColor Magenta
+        Write-Host "$($lowestJitterPair.Secondary.Provider)" -NoNewline -ForegroundColor Magenta
         Write-Host ") - " -NoNewline -ForegroundColor DarkGray
-        Write-Host "$($bestSameProviderPair.Secondary.ResponseTime)" -NoNewline -ForegroundColor Green
+        Write-Host "$($lowestJitterPair.Secondary.ResponseTime)" -NoNewline -ForegroundColor Green
         Write-Host " (Jitter: " -NoNewline -ForegroundColor DarkGray
-        Write-Host "$($bestSameProviderPair.Secondary.Jitter)" -NoNewline -ForegroundColor Yellow
+        Write-Host "$($lowestJitterPair.Secondary.Jitter)" -NoNewline -ForegroundColor Yellow
         Write-Host ") [" -NoNewline -ForegroundColor DarkGray
-        Write-Host "$($bestSameProviderPair.Secondary.Category)" -NoNewline -ForegroundColor Blue
+        Write-Host "$($lowestJitterPair.Secondary.Category)" -NoNewline -ForegroundColor Blue
         Write-Host "]" -ForegroundColor DarkGray
         
-        Write-ColoredMessage "    ✓ Pro: Unified infrastructure, consistent performance, proper redundancy" -Color DarkGreen
-        Write-ColoredMessage "    ✗ Con: Single provider dependency (no diversity)" -Color DarkYellow
-        Write-Host "    Stats: Avg Score: " -NoNewline -ForegroundColor White
-        Write-Host "$([math]::Round($bestSameProviderPair.AverageScore, 2))" -NoNewline -ForegroundColor Cyan
-        Write-Host " | Avg Latency: " -NoNewline -ForegroundColor White
-        Write-Host "$([math]::Round($bestSameProviderPair.AverageLatency, 2)) ms" -ForegroundColor Cyan
+        Write-ColoredMessage "    ✓ Pro: Most consistent performance, ideal for gaming/streaming" -Color DarkGreen
+        Write-ColoredMessage "    ✗ Con: May not have lowest latency" -Color DarkYellow
+        Write-Host "    Stats: Avg Jitter: " -NoNewline -ForegroundColor White
+        Write-Host "$([math]::Round($lowestJitterPair.AverageJitter, 2)) ms" -ForegroundColor Cyan
     } else {
-        Write-ColoredMessage "    No valid same-provider pair found" -Color Red
+        Write-ColoredMessage "    No valid DNS found" -Color Red
     }
 
     # Option 8: Best Same Provider Pair (Global)
@@ -2851,6 +3312,7 @@ if ($recommendations.Count -gt 0) {
     Write-Host "best balance" -NoNewline -ForegroundColor Cyan
     Write-Host " of speed, reliability, and redundancy." -ForegroundColor White
 } else {
+    $topRecommendation = $null
     Write-ColoredMessage "`nNo valid recommendations available." -Color Red
 }
 
@@ -2986,9 +3448,13 @@ if (-not $SkipIPv6Test -or -not $SkipDNSSECTest -or -not $SkipResponseVerificati
     Write-ColoredMessage "`nAdvanced tests disabled. Use -TestIPv6, -TestDNSSEC, -VerifyResponses, -TestEDNS0, or -TestTCP to enable." -Color Gray
 }
 
-# Store the best choice for script generation
-if ($recommendations.Count -gt 0) {
-    $script:RecommendedPair = $recommendations[0].Pair
+# Store the best choice for script generation. Use the same Score-sorted
+# winner that the "RECOMMENDED CHOICE" banner displayed (NOT $recommendations[0],
+# which is the first-by-insertion-order pair and disagrees with the banner
+# whenever a Mixed pair exists alongside a faster category-specific pair).
+if ($topRecommendation) {
+    $script:RecommendedPair = $topRecommendation.Pair
+    $script:RecommendedType = $topRecommendation.Type
 }
 
 
@@ -3005,13 +3471,132 @@ if ($ExportPath) {
         # Create directory if it doesn't exist
         $directory = Split-Path -Path $filename -Parent
         if ($directory -and -not (Test-Path $directory)) {
-            New-Item -ItemType Directory -Path $directory -Force | Out-Null
+            New-Item -ItemType Directory -Path $directory -Force -WhatIf:$false -Confirm:$false | Out-Null
         }
         
-        $results | Export-Csv -Path $filename -NoTypeInformation
+        $results | Export-Csv -Path $filename -NoTypeInformation -WhatIf:$false -Confirm:$false
         Write-ColoredMessage "`nResults exported to $filename" -Color Green
     } catch {
         Write-ColoredMessage "Error exporting results: $_" -Color Red
+    }
+}
+
+# Export results to JSON if specified. Unlike the CSV export, this preserves
+# the full structured shape of the result + recommendation objects.
+if ($ExportJson) {
+    try {
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $jsonFile = if ($ExportJson -match '\.json$') {
+            $ExportJson
+        } else {
+            Join-Path $ExportJson "DNSTest_$timestamp.json"
+        }
+
+        $jsonDir = Split-Path -Path $jsonFile -Parent
+        if ($jsonDir -and -not (Test-Path $jsonDir)) {
+            New-Item -ItemType Directory -Path $jsonDir -Force -WhatIf:$false -Confirm:$false | Out-Null
+        }
+
+        $payload = [ordered]@{
+            schemaVersion = 1
+            generatedAt   = (Get-Date).ToString('o')
+            parameters    = [ordered]@{
+                domain         = $Domain
+                category       = $Category
+                protocol       = $Protocol
+                testCount      = $TestCount
+                timeout        = $Timeout
+                quickTest      = [bool]$QuickTest
+                parallel       = [bool]$Parallel
+                maxThreads     = $MaxThreads
+                cacheBust      = [bool]$CacheBust
+                maxRetries     = $MaxRetries
+                mlProfile      = $MLProfile
+                jitterWeight   = $JitterWeight
+            }
+            results         = $results
+            recommendations = $recommendations
+        }
+
+        $payload | ConvertTo-Json -Depth 8 | Out-File -FilePath $jsonFile -Encoding UTF8 -WhatIf:$false -Confirm:$false
+        Write-ColoredMessage "Results exported as JSON to $jsonFile" -Color Green
+    } catch {
+        Write-ColoredMessage "Error exporting JSON: $_" -Color Red
+    }
+}
+
+# Self-contained HTML report.
+if ($ExportHtml) {
+    try {
+        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+        $htmlFile = if ($ExportHtml -match '\.html?$') {
+            $ExportHtml
+        } else {
+            Join-Path $ExportHtml "DNSTest_$timestamp.html"
+        }
+        $htmlDir = Split-Path -Path $htmlFile -Parent
+        if ($htmlDir -and -not (Test-Path $htmlDir)) {
+            New-Item -ItemType Directory -Path $htmlDir -Force -WhatIf:$false -Confirm:$false | Out-Null
+        }
+
+        # Encode-everything HTML escape - small inline helper to avoid pulling
+        # System.Web for one call.
+        $escape = {
+            param($s)
+            if ($null -eq $s) { return '' }
+            ([string]$s).Replace('&','&amp;').Replace('<','&lt;').Replace('>','&gt;').Replace('"','&quot;')
+        }
+
+        $rowsHtml = ($results | ForEach-Object {
+            $statusClass = if ($_.Status -eq 'Success') { 'ok' } else { 'err' }
+            "      <tr class='$statusClass'><td>$(& $escape $_.Provider)</td><td><code>$(& $escape $_.IP)</code></td><td>$(& $escape $_.Category)</td><td>$(& $escape $_.Domain)</td><td>$(& $escape $_.RecordType)</td><td>$(& $escape $_.ResponseTime)</td><td>$(& $escape $_.Jitter)</td><td>$(& $escape $_.SuccessRate)%</td><td>$(& $escape $_.Status)</td></tr>"
+        }) -join "`n"
+
+        $recoHtml = if ($script:RecommendedPair -and $script:RecommendedPair.Primary) {
+            "    <p><strong>Recommended pair:</strong> $(& $escape $script:RecommendedPair.Primary.Provider) (<code>$(& $escape $script:RecommendedPair.Primary.IP)</code>) + $(& $escape $script:RecommendedPair.Secondary.Provider) (<code>$(& $escape $script:RecommendedPair.Secondary.IP)</code>)</p>"
+        } else { "    <p><em>No recommendation produced.</em></p>" }
+
+        $genTime = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz')
+        $html = @"
+<!doctype html>
+<html lang='en'>
+<head>
+  <meta charset='utf-8'>
+  <title>DNS Benchmark Report &mdash; $(& $escape $Domain)</title>
+  <style>
+    body { font: 14px/1.45 -apple-system, Segoe UI, Roboto, sans-serif; margin: 2em; color: #1f2328; }
+    h1 { margin-bottom: 0; }
+    .meta { color: #57606a; margin-bottom: 1.5em; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { padding: 6px 10px; border-bottom: 1px solid #d0d7de; text-align: left; }
+    th { background: #f6f8fa; }
+    tr.err td { color: #cf222e; }
+    tr.ok td:nth-child(6), tr.ok td:nth-child(7) { font-variant-numeric: tabular-nums; }
+    code { background: #eaeef2; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+    .reco { background: #ddf4ff; padding: 10px 14px; border-radius: 6px; margin: 1em 0; border: 1px solid #54aeff; }
+  </style>
+</head>
+<body>
+  <h1>DNS Benchmark Report</h1>
+  <div class='meta'>Generated $(& $escape $genTime) &middot; domain <code>$(& $escape $Domain)</code> &middot; category <code>$(& $escape $Category)</code> &middot; protocol <code>$(& $escape $Protocol)</code> &middot; run <code>$(& $escape $script:RunId)</code></div>
+  <div class='reco'>
+$recoHtml
+  </div>
+  <h2>Results ($(($results | Measure-Object).Count))</h2>
+  <table>
+    <thead><tr><th>Provider</th><th>IP</th><th>Category</th><th>Domain</th><th>Type</th><th>Response (ms)</th><th>Jitter (ms)</th><th>Success</th><th>Status</th></tr></thead>
+    <tbody>
+$rowsHtml
+    </tbody>
+  </table>
+</body>
+</html>
+"@
+
+        $html | Out-File -FilePath $htmlFile -Encoding UTF8 -WhatIf:$false -Confirm:$false
+        Write-ColoredMessage "HTML report written to $htmlFile" -Color Green
+    } catch {
+        Write-ColoredMessage "Error exporting HTML: $_" -Color Red
     }
 }
 
@@ -3023,7 +3608,8 @@ Write-ColoredMessage "======================================" -Color Cyan
 if ($script:RecommendedPair -and $script:RecommendedPair.Primary -and $script:RecommendedPair.Secondary) {
     $bestOverallPair = $script:RecommendedPair
     
-    Write-ColoredMessage "`nUsing Recommended Configuration:" -Color Magenta
+    $typeLabel = if ($script:RecommendedType) { " ($($script:RecommendedType))" } else { "" }
+    Write-ColoredMessage "`nUsing Recommended Configuration${typeLabel}:" -Color Magenta
     Write-ColoredMessage "Primary:   $($bestOverallPair.Primary.IP) ($($bestOverallPair.Primary.Provider))" -Color Green
     Write-ColoredMessage "Secondary: $($bestOverallPair.Secondary.IP) ($($bestOverallPair.Secondary.Provider))" -Color Green
     
@@ -3036,6 +3622,40 @@ if ($script:RecommendedPair -and $script:RecommendedPair.Primary -and $script:Re
     
     Write-ColoredMessage "`nMacOS:" -Color Yellow
     Write-ColoredMessage "networksetup -setdnsservers Wi-Fi $($bestOverallPair.Primary.IP) $($bestOverallPair.Secondary.IP)" -Color White
+    
+    # -ApplyDNS actually executes the Windows command, with -WhatIf / -Confirm
+    # routed through ShouldProcess. Skipped on non-Windows for safety.
+    if ($ApplyDNS) {
+        if ($PSVersionTable.Platform -and $PSVersionTable.Platform -ne 'Win32NT') {
+            Write-ColoredMessage "`n-ApplyDNS is only implemented for Windows; skipping on $($PSVersionTable.Platform)." -Color Yellow -Force
+        } else {
+            $servers = @($bestOverallPair.Primary.IP, $bestOverallPair.Secondary.IP)
+            $target = "interface(s) matching '$InterfaceAlias' -> $($servers -join ', ')"
+            if ($PSCmdlet.ShouldProcess($target, 'Set-DnsClientServerAddress')) {
+                try {
+                    $adapters = Get-NetAdapter -ErrorAction Stop | Where-Object {
+                        $_.Status -eq 'Up' -and $_.InterfaceAlias -like $InterfaceAlias
+                    }
+                    if (-not $adapters) {
+                        Write-ColoredMessage "No matching 'Up' adapters found for alias '$InterfaceAlias'. Nothing applied." -Color Yellow -Force
+                        Write-StructuredLog -Event 'apply-skipped' -Data @{ reason='no-adapters'; alias=$InterfaceAlias }
+                    } else {
+                        foreach ($a in $adapters) {
+                            Set-DnsClientServerAddress -InterfaceIndex $a.ifIndex -ServerAddresses $servers -ErrorAction Stop
+                            Write-ColoredMessage "Applied DNS to $($a.InterfaceAlias) (ifIndex $($a.ifIndex))." -Color Green -Force
+                            Write-StructuredLog -Event 'apply-success' -Data @{ alias=$a.InterfaceAlias; ifIndex=$a.ifIndex; servers=$servers }
+                        }
+                        try { Clear-DnsClientCache -ErrorAction Stop; Write-ColoredMessage "DNS client cache cleared." -Color Green -Force } catch { }
+                    }
+                } catch {
+                    Write-ColoredMessage "Failed to apply DNS settings: $_" -Color Red -Force
+                    Write-StructuredLog -Event 'apply-failed' -Data @{ error="$_" }
+                }
+            } else {
+                Write-StructuredLog -Event 'apply-whatif' -Data @{ servers=$servers; alias=$InterfaceAlias }
+            }
+        }
+    }
     
     # Generate configuration scripts if requested
     if ($GenerateScripts) {
@@ -3104,11 +3724,11 @@ echo "DNS configuration updated and cache flushed"
             try {
                 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
                 $scriptDir = Join-Path $PWD "dns-config-scripts-$timestamp"
-                New-Item -ItemType Directory -Path $scriptDir -Force | Out-Null
+                New-Item -ItemType Directory -Path $scriptDir -Force -WhatIf:$false -Confirm:$false | Out-Null
                 
-                $windowsScript | Out-File -FilePath (Join-Path $scriptDir "configure-dns-windows.ps1") -Encoding UTF8
-                $linuxScript | Out-File -FilePath (Join-Path $scriptDir "configure-dns-linux.sh") -Encoding UTF8
-                $macScript | Out-File -FilePath (Join-Path $scriptDir "configure-dns-macos.sh") -Encoding UTF8
+                $windowsScript | Out-File -FilePath (Join-Path $scriptDir "configure-dns-windows.ps1") -Encoding UTF8 -WhatIf:$false -Confirm:$false
+                $linuxScript | Out-File -FilePath (Join-Path $scriptDir "configure-dns-linux.sh") -Encoding UTF8 -WhatIf:$false -Confirm:$false
+                $macScript | Out-File -FilePath (Join-Path $scriptDir "configure-dns-macos.sh") -Encoding UTF8 -WhatIf:$false -Confirm:$false
                 
                 Write-ColoredMessage "Scripts generated in: $scriptDir" -Color Green
                 Write-ColoredMessage "Windows: configure-dns-windows.ps1 (Run as Administrator)" -Color Yellow
@@ -3118,23 +3738,23 @@ echo "DNS configuration updated and cache flushed"
                 Write-ColoredMessage "Error generating scripts: $_" -Color Red
             }
         }
-} else {
-    Write-ColoredMessage "`nNo valid DNS configuration found. All tested DNS servers failed or timed out." -Color Red
-    Write-ColoredMessage "Try increasing the timeout parameter or checking your network connection." -Color Yellow
-}
+    } else {
+        Write-ColoredMessage "`nNo valid DNS configuration found. All tested DNS servers failed or timed out." -Color Red
+        Write-ColoredMessage "Try increasing the timeout parameter or checking your network connection." -Color Yellow
+    }
 
 # Skip displaying removed DNS table (redundant - shown in persistent tracking below)
 
 # Save persistent tracking history
 if (-not $DisablePersistentTracking) {
-    Save-PersistentTracking -History $global:PersistentHistory
+    Save-PersistentTracking -History $script:PersistentHistory
     
     # Show summary of newly failed DNS servers
     $newlyFailed = @()
     $approachingBlacklist = @()
     
-    foreach ($dns in $global:PersistentHistory.Keys) {
-        $record = $global:PersistentHistory[$dns]
+    foreach ($dns in $script:PersistentHistory.Keys) {
+        $record = $script:PersistentHistory[$dns]
         if ($record.FailureCount -gt 0 -and -not $record.Blacklisted) {
             $approachingBlacklist += [PSCustomObject]@{
                 IP = $dns
@@ -3160,14 +3780,14 @@ if (-not $DisablePersistentTracking) {
 }
 
 # Save ML training data and track best pairs
-if ($global:MLEnabled) {
+if ($script:MLEnabled) {
     # Track the best DNS pairs discovered in this run
     if ($bestOverallPair -and $bestOverallPair.Primary -and $bestOverallPair.Secondary) {
         $primaryRT = [double]($bestOverallPair.Primary.ResponseTime -replace ' ms$', '')
         $secondaryRT = [double]($bestOverallPair.Secondary.ResponseTime -replace ' ms$', '')
         $combinedScore = ($primaryRT + $secondaryRT) / 2
         
-        Update-PairMLData -MLData $global:MLData `
+        Update-PairMLData -MLData $script:MLData `
             -PrimaryIP $bestOverallPair.Primary.IP `
             -SecondaryIP $bestOverallPair.Secondary.IP `
             -PrimaryProvider $bestOverallPair.Primary.Provider `
@@ -3181,7 +3801,7 @@ if ($global:MLEnabled) {
         $secondaryRT = [double]($bestSameProviderPairGlobal.Secondary.ResponseTime -replace ' ms$', '')
         $combinedScore = ($primaryRT + $secondaryRT) / 2
         
-        Update-PairMLData -MLData $global:MLData `
+        Update-PairMLData -MLData $script:MLData `
             -PrimaryIP $bestSameProviderPairGlobal.Primary.IP `
             -SecondaryIP $bestSameProviderPairGlobal.Secondary.IP `
             -PrimaryProvider $bestSameProviderPairGlobal.Primary.Provider `
@@ -3195,7 +3815,7 @@ if ($global:MLEnabled) {
         $secondaryRT = [double]($bestMixedPair.Secondary.ResponseTime -replace ' ms$', '')
         $combinedScore = ($primaryRT + $secondaryRT) / 2
         
-        Update-PairMLData -MLData $global:MLData `
+        Update-PairMLData -MLData $script:MLData `
             -PrimaryIP $bestMixedPair.Primary.IP `
             -SecondaryIP $bestMixedPair.Secondary.IP `
             -PrimaryProvider $bestMixedPair.Primary.Provider `
@@ -3205,21 +3825,21 @@ if ($global:MLEnabled) {
     }
     
     # Increment total runs
-    $global:MLData.TotalRuns++
+    $script:MLData.TotalRuns++
     
     # Save ML data
-    if (Save-MLData -Data $global:MLData) {
-        Write-ColoredMessage "`nML training data saved. Total runs: $($global:MLData.TotalRuns)" -Color Green
+    if (Save-MLData -Data $script:MLData) {
+        Write-ColoredMessage "`nML training data saved. Total runs: $($script:MLData.TotalRuns)" -Color Green
         
         # Export ML recommendations report
         $mlReportPath = Join-Path $PSScriptRoot "dns-ml-recommendations.txt"
-        Export-MLRecommendations -MLData $global:MLData -OutputPath $mlReportPath
+        Export-MLRecommendations -MLData $script:MLData -OutputPath $mlReportPath
     }
 }
 
 # Calculate and display test duration
-$global:TestEndTime = Get-Date
-$testDuration = $global:TestEndTime - $global:TestStartTime
+$script:TestEndTime = Get-Date
+$testDuration = $script:TestEndTime - $script:TestStartTime
 $durationSeconds = [Math]::Round($testDuration.TotalSeconds, 1)
 $durationFormatted = if ($testDuration.TotalMinutes -ge 1) {
     "$([Math]::Floor($testDuration.TotalMinutes)) min $([Math]::Round($testDuration.Seconds, 0)) sec"
@@ -3231,3 +3851,21 @@ Write-ColoredMessage "`n========================================" -Color Green
 Write-ColoredMessage "DNS Performance Test completed." -Color Cyan
 Write-ColoredMessage "Total Test Duration: $durationFormatted ($durationSeconds seconds)" -Color Green
 Write-ColoredMessage "========================================" -Color Green
+
+Write-StructuredLog -Event 'run-end' -Data @{
+    durationSeconds = $durationSeconds
+    resultCount     = ($results | Measure-Object).Count
+    recommendation  = if ($script:RecommendedPair -and $script:RecommendedPair.Primary) {
+        "$($script:RecommendedPair.Primary.IP),$($script:RecommendedPair.Secondary.IP)"
+    } else { '' }
+}
+Close-StructuredLog
+
+# Tear down the shared runspace pool so its threads don't keep the host alive.
+if ($null -ne $script:DnsRunspacePool) {
+    try {
+        $script:DnsRunspacePool.Close()
+        $script:DnsRunspacePool.Dispose()
+    } catch { }
+    $script:DnsRunspacePool = $null
+}

@@ -1,72 +1,667 @@
 {
-  "8.8.4.4": {
-    "SuccessCount": 2,
+  "94.140.14.14": {
     "FailureCount": 0,
-    "TotalRuns": 2,
-    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "SuccessCount": 69,
+    "LastFailure": "2026-04-17T11:28:25.0433377+02:00",
+    "TotalRuns": 71,
     "Blacklisted": false
   },
-  "8.8.8.8": {
-    "SuccessCount": 2,
+  "193.19.108.2": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:45:05.1054721+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "64.6.64.6": {
     "FailureCount": 0,
-    "TotalRuns": 2,
+    "SuccessCount": 69,
     "LastFailure": "0001-01-01T00:00:00.0000000",
+    "TotalRuns": 69,
     "Blacklisted": false
   },
-  "163.121.128.134": {
-    "SuccessCount": 2,
+  "77.88.8.7": {
+    "FailureCount": 3,
+    "SuccessCount": 43,
+    "LastFailure": "2026-02-11T16:01:43.3776357+02:00",
+    "TotalRuns": 49,
+    "Blacklisted": true
+  },
+  "1.1.1.2": {
     "FailureCount": 0,
-    "TotalRuns": 2,
-    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "SuccessCount": 68,
+    "LastFailure": "2026-04-17T11:28:10.4471722+02:00",
+    "TotalRuns": 69,
     "Blacklisted": false
   },
-  "208.67.222.222": {
-    "SuccessCount": 2,
+  "198.54.117.11": {
     "FailureCount": 0,
-    "TotalRuns": 2,
-    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "SuccessCount": 67,
+    "LastFailure": "2026-02-11T16:01:04.4589125+02:00",
+    "TotalRuns": 69,
     "Blacklisted": false
   },
-  "1.1.1.1": {
-    "SuccessCount": 2,
+  "45.90.28.167": {
     "FailureCount": 0,
-    "TotalRuns": 2,
-    "LastFailure": "0001-01-01T00:00:00.0000000",
-    "Blacklisted": false
-  },
-  "1.0.0.1": {
-    "SuccessCount": 2,
-    "FailureCount": 0,
-    "TotalRuns": 2,
-    "LastFailure": "0001-01-01T00:00:00.0000000",
-    "Blacklisted": false
-  },
-  "9.9.9.9": {
-    "SuccessCount": 2,
-    "FailureCount": 0,
-    "TotalRuns": 2,
-    "LastFailure": "0001-01-01T00:00:00.0000000",
-    "Blacklisted": false
-  },
-  "208.67.220.220": {
-    "SuccessCount": 2,
-    "FailureCount": 0,
-    "TotalRuns": 2,
-    "LastFailure": "0001-01-01T00:00:00.0000000",
-    "Blacklisted": false
-  },
-  "163.121.128.135": {
-    "SuccessCount": 2,
-    "FailureCount": 0,
-    "TotalRuns": 2,
-    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "SuccessCount": 68,
+    "LastFailure": "2026-04-17T11:27:48.7590996+02:00",
+    "TotalRuns": 69,
     "Blacklisted": false
   },
   "149.112.112.112": {
-    "SuccessCount": 2,
     "FailureCount": 0,
-    "TotalRuns": 2,
-    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "SuccessCount": 68,
+    "LastFailure": "2025-12-13T11:16:03.9192512+02:00",
+    "TotalRuns": 72,
     "Blacklisted": false
+  },
+  "77.88.8.1": {
+    "FailureCount": 0,
+    "SuccessCount": 72,
+    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "TotalRuns": 72,
+    "Blacklisted": false
+  },
+  "95.216.24.230": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:47:13.4138874+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "9.9.9.11": {
+    "FailureCount": 0,
+    "SuccessCount": 61,
+    "LastFailure": "2026-02-22T12:21:19.8737722+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "76.76.2.3": {
+    "FailureCount": 0,
+    "SuccessCount": 69,
+    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "76.223.100.101": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:44:05.9273973+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "76.76.10.0": {
+    "FailureCount": 0,
+    "SuccessCount": 68,
+    "LastFailure": "2025-12-26T11:36:24.8522391+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "185.228.168.168": {
+    "FailureCount": 0,
+    "SuccessCount": 68,
+    "LastFailure": "2025-11-29T22:13:53.9010221+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "208.67.222.123": {
+    "FailureCount": 0,
+    "SuccessCount": 66,
+    "LastFailure": "2026-01-12T10:05:43.0151823+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "116.202.176.26": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:45:16.7981224+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "149.112.121.10": {
+    "FailureCount": 0,
+    "SuccessCount": 66,
+    "LastFailure": "2026-02-23T11:03:05.5860840+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "4.2.2.1": {
+    "FailureCount": 3,
+    "SuccessCount": 11,
+    "LastFailure": "2025-12-08T22:06:06.0008241+02:00",
+    "TotalRuns": 21,
+    "Blacklisted": true
+  },
+  "185.228.168.10": {
+    "FailureCount": 0,
+    "SuccessCount": 68,
+    "LastFailure": "2026-01-01T18:33:22.5870874+02:00",
+    "TotalRuns": 72,
+    "Blacklisted": false
+  },
+  "77.88.8.88": {
+    "FailureCount": 0,
+    "SuccessCount": 69,
+    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "94.140.14.141": {
+    "FailureCount": 0,
+    "SuccessCount": 68,
+    "LastFailure": "2026-04-17T11:27:43.7897321+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "185.43.135.1": {
+    "FailureCount": 0,
+    "SuccessCount": 67,
+    "LastFailure": "2025-12-12T20:27:50.3119975+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "8.20.247.20": {
+    "FailureCount": 3,
+    "SuccessCount": 41,
+    "LastFailure": "2026-02-11T16:02:09.5695363+02:00",
+    "TotalRuns": 49,
+    "Blacklisted": true
+  },
+  "1.0.0.3": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:44:29.2650304+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "194.242.2.2": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:44:53.4119544+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "109.69.8.51": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:46:15.1243241+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "176.103.130.130": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:45:40.1246467+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "94.140.15.15": {
+    "FailureCount": 0,
+    "SuccessCount": 67,
+    "LastFailure": "2025-12-26T11:36:56.9871872+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "194.145.240.6": {
+    "FailureCount": 0,
+    "SuccessCount": 57,
+    "LastFailure": "2026-03-28T19:15:25.2551082+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "84.200.70.40": {
+    "FailureCount": 3,
+    "SuccessCount": 16,
+    "LastFailure": "2025-12-13T11:16:20.5883653+02:00",
+    "TotalRuns": 27,
+    "Blacklisted": true
+  },
+  "1.1.1.1": {
+    "FailureCount": 0,
+    "SuccessCount": 73,
+    "LastFailure": "2026-01-17T11:35:47.9456721+02:00",
+    "TotalRuns": 75,
+    "Blacklisted": false
+  },
+  "109.69.8.52": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:47:25.8323423+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "208.67.222.222": {
+    "FailureCount": 0,
+    "SuccessCount": 75,
+    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "TotalRuns": 75,
+    "Blacklisted": false
+  },
+  "185.228.168.9": {
+    "FailureCount": 0,
+    "SuccessCount": 69,
+    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "5.2.75.75": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:44:52.6414966+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "4.2.2.4": {
+    "FailureCount": 3,
+    "SuccessCount": 1,
+    "LastFailure": "2025-11-29T23:17:20.4092339+02:00",
+    "TotalRuns": 5,
+    "Blacklisted": true
+  },
+  "146.255.56.98": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:46:50.0977064+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "149.112.122.10": {
+    "FailureCount": 0,
+    "SuccessCount": 68,
+    "LastFailure": "2026-04-17T11:27:57.5574496+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "8.8.4.4": {
+    "FailureCount": 0,
+    "SuccessCount": 75,
+    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "TotalRuns": 75,
+    "Blacklisted": false
+  },
+  "193.17.47.1": {
+    "FailureCount": 0,
+    "SuccessCount": 69,
+    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "1.0.0.2": {
+    "FailureCount": 0,
+    "SuccessCount": 69,
+    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "2620:fe::fe": {
+    "FailureCount": 1,
+    "SuccessCount": 0,
+    "LastFailure": "2026-04-20T14:41:30.3520840+02:00",
+    "TotalRuns": 1,
+    "Blacklisted": false
+  },
+  "185.228.169.9": {
+    "FailureCount": 0,
+    "SuccessCount": 72,
+    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "TotalRuns": 72,
+    "Blacklisted": false
+  },
+  "8.26.56.26": {
+    "FailureCount": 3,
+    "SuccessCount": 41,
+    "LastFailure": "2026-02-11T11:05:17.8306877+02:00",
+    "TotalRuns": 48,
+    "Blacklisted": true
+  },
+  "185.95.218.43": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:46:38.4469016+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "2001:4860:4860::8888": {
+    "FailureCount": 1,
+    "SuccessCount": 0,
+    "LastFailure": "2026-04-20T14:41:30.3458282+02:00",
+    "TotalRuns": 1,
+    "Blacklisted": false
+  },
+  "84.200.69.80": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:47:27.8094808+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "76.76.2.0": {
+    "FailureCount": 0,
+    "SuccessCount": 65,
+    "LastFailure": "2026-02-21T13:59:23.8666710+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "76.76.19.19": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:44:17.5804039+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "76.76.10.1": {
+    "FailureCount": 0,
+    "SuccessCount": 69,
+    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "195.46.39.40": {
+    "FailureCount": 0,
+    "SuccessCount": 68,
+    "LastFailure": "2025-11-29T00:20:54.4889142+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "149.112.112.11": {
+    "FailureCount": 0,
+    "SuccessCount": 64,
+    "LastFailure": "2026-01-06T13:41:21.2252515+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "176.103.130.131": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:45:51.7927308+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "89.233.43.71": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:43:42.5905630+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "45.91.92.121": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:44:40.9254485+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "161.97.219.84": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:47:14.1520784+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "95.216.229.153": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:45:28.4773900+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "2606:4700:4700::1001": {
+    "FailureCount": 1,
+    "SuccessCount": 0,
+    "LastFailure": "2026-04-20T14:41:30.3424120+02:00",
+    "TotalRuns": 1,
+    "Blacklisted": false
+  },
+  "2620:fe::9": {
+    "FailureCount": 1,
+    "SuccessCount": 0,
+    "LastFailure": "2026-04-20T14:41:30.3550095+02:00",
+    "TotalRuns": 1,
+    "Blacklisted": false
+  },
+  "45.90.30.167": {
+    "FailureCount": 3,
+    "SuccessCount": 38,
+    "LastFailure": "2026-01-07T09:34:45.5690367+02:00",
+    "TotalRuns": 42,
+    "Blacklisted": true
+  },
+  "185.228.169.11": {
+    "FailureCount": 0,
+    "SuccessCount": 63,
+    "LastFailure": "2026-04-08T12:39:10.3825362+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "76.76.10.3": {
+    "FailureCount": 0,
+    "SuccessCount": 68,
+    "LastFailure": "2025-12-04T19:05:48.4669250+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "4.2.2.3": {
+    "FailureCount": 3,
+    "SuccessCount": 9,
+    "LastFailure": "2025-12-06T11:04:43.3892850+02:00",
+    "TotalRuns": 17,
+    "Blacklisted": true
+  },
+  "9.9.9.10": {
+    "FailureCount": 0,
+    "SuccessCount": 67,
+    "LastFailure": "2026-01-01T18:33:00.7559038+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "208.67.220.220": {
+    "FailureCount": 0,
+    "SuccessCount": 75,
+    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "TotalRuns": 75,
+    "Blacklisted": false
+  },
+  "2606:4700:4700::1111": {
+    "FailureCount": 1,
+    "SuccessCount": 0,
+    "LastFailure": "2026-04-20T14:41:30.3389726+02:00",
+    "TotalRuns": 1,
+    "Blacklisted": false
+  },
+  "185.95.218.42": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:46:26.7886066+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "77.88.8.8": {
+    "FailureCount": 0,
+    "SuccessCount": 67,
+    "LastFailure": "2025-12-14T10:35:24.0151220+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "8.8.8.8": {
+    "FailureCount": 0,
+    "SuccessCount": 77,
+    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "TotalRuns": 77,
+    "Blacklisted": false
+  },
+  "208.67.220.123": {
+    "FailureCount": 0,
+    "SuccessCount": 67,
+    "LastFailure": "2026-01-17T11:36:11.4888920+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "163.121.128.135": {
+    "FailureCount": 0,
+    "SuccessCount": 75,
+    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "TotalRuns": 75,
+    "Blacklisted": false
+  },
+  "163.121.128.134": {
+    "FailureCount": 0,
+    "SuccessCount": 75,
+    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "TotalRuns": 75,
+    "Blacklisted": false
+  },
+  "74.82.42.42": {
+    "FailureCount": 0,
+    "SuccessCount": 67,
+    "LastFailure": "2025-12-03T09:57:40.6133620+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "9.9.9.9": {
+    "FailureCount": 1,
+    "SuccessCount": 71,
+    "LastFailure": "2026-04-20T14:41:30.3311290+02:00",
+    "TotalRuns": 75,
+    "Blacklisted": false
+  },
+  "91.239.100.100": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:43:54.2628471+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "94.140.14.15": {
+    "FailureCount": 0,
+    "SuccessCount": 68,
+    "LastFailure": "2025-12-05T13:06:50.5990626+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "94.140.14.140": {
+    "FailureCount": 0,
+    "SuccessCount": 69,
+    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "185.228.169.168": {
+    "FailureCount": 0,
+    "SuccessCount": 69,
+    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "37.235.1.174": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:43:05.8197785+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "1.0.0.1": {
+    "FailureCount": 0,
+    "SuccessCount": 73,
+    "LastFailure": "2026-01-17T11:35:35.3701294+02:00",
+    "TotalRuns": 75,
+    "Blacklisted": false
+  },
+  "149.112.112.10": {
+    "FailureCount": 3,
+    "SuccessCount": 32,
+    "LastFailure": "2025-12-31T19:02:10.3851154+02:00",
+    "TotalRuns": 36,
+    "Blacklisted": true
+  },
+  "45.90.28.0": {
+    "FailureCount": 0,
+    "SuccessCount": 1,
+    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "TotalRuns": 1,
+    "Blacklisted": false
+  },
+  "4.2.2.2": {
+    "FailureCount": 3,
+    "SuccessCount": 4,
+    "LastFailure": "2025-12-04T20:02:40.5591230+02:00",
+    "TotalRuns": 12,
+    "Blacklisted": true
+  },
+  "64.6.65.6": {
+    "FailureCount": 0,
+    "SuccessCount": 69,
+    "LastFailure": "0001-01-01T00:00:00.0000000",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "2001:4860:4860::8844": {
+    "FailureCount": 1,
+    "SuccessCount": 0,
+    "LastFailure": "2026-04-20T14:41:30.3489687+02:00",
+    "TotalRuns": 1,
+    "Blacklisted": false
+  },
+  "76.76.2.1": {
+    "FailureCount": 0,
+    "SuccessCount": 68,
+    "LastFailure": "2026-04-17T11:28:12.2529193+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "45.79.120.233": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:46:03.4583216+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "1.1.1.3": {
+    "FailureCount": 3,
+    "SuccessCount": 39,
+    "LastFailure": "2026-01-07T09:34:32.5342440+02:00",
+    "TotalRuns": 42,
+    "Blacklisted": true
+  },
+  "198.54.117.10": {
+    "FailureCount": 0,
+    "SuccessCount": 68,
+    "LastFailure": "2025-12-01T10:35:16.7102054+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "195.46.39.39": {
+    "FailureCount": 0,
+    "SuccessCount": 68,
+    "LastFailure": "2026-01-05T20:25:31.1370076+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "94.140.15.16": {
+    "FailureCount": 0,
+    "SuccessCount": 67,
+    "LastFailure": "2025-12-14T10:35:56.9842545+02:00",
+    "TotalRuns": 69,
+    "Blacklisted": false
+  },
+  "45.67.219.208": {
+    "FailureCount": 3,
+    "SuccessCount": 3,
+    "LastFailure": "2025-11-30T11:15:12.3098383+02:00",
+    "TotalRuns": 6,
+    "Blacklisted": true
+  },
+  "37.235.1.177": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:43:29.7269727+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
+  },
+  "159.69.198.101": {
+    "FailureCount": 3,
+    "SuccessCount": 0,
+    "LastFailure": "2025-11-29T11:47:01.7509664+02:00",
+    "TotalRuns": 3,
+    "Blacklisted": true
   }
 }

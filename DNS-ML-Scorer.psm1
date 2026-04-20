@@ -279,12 +279,19 @@ function Get-PairDiversityBonus {
 function Initialize-MLData {
     <#
     .SYNOPSIS
-    Initialize or load ML training data
+    Initialize or load ML training data.
+    .PARAMETER DataFile
+    Optional override for the on-disk JSON file path. Used by tests to
+    isolate from the real persisted data.
     #>
-    
-    if (Test-Path $script:MLDataFile) {
+    [CmdletBinding()]
+    param(
+        [string]$DataFile = $script:MLDataFile
+    )
+
+    if (Test-Path $DataFile) {
         try {
-            $json = Get-Content $script:MLDataFile -Raw | ConvertFrom-Json
+            $json = Get-Content $DataFile -Raw | ConvertFrom-Json
             
             return @{
                 Servers = ConvertFrom-JsonObject $json.Servers
@@ -298,10 +305,10 @@ function Initialize-MLData {
                 }
             }
         } catch {
-            $backupPath = "$($script:MLDataFile).corrupt-$(Get-Date -Format 'yyyyMMdd-HHmmss').bak"
+            $backupPath = "$($DataFile).corrupt-$(Get-Date -Format 'yyyyMMdd-HHmmss').bak"
             Write-Warning "Failed to load ML data ($_)."
             try {
-                Copy-Item -Path $script:MLDataFile -Destination $backupPath -Force -ErrorAction Stop
+                Copy-Item -Path $DataFile -Destination $backupPath -Force -ErrorAction Stop
                 Write-Warning "Corrupt ML data file backed up to: $backupPath"
             } catch {
                 Write-Warning "Could not back up corrupt ML data file: $_"
@@ -347,15 +354,18 @@ function ConvertFrom-JsonObject {
 }
 
 function Save-MLData {
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory=$true)]
-        [hashtable]$Data
+        [hashtable]$Data,
+
+        [string]$DataFile = $script:MLDataFile
     )
     
     try {
         $Data.LastUpdate = Get-Date
         $json = $Data | ConvertTo-Json -Depth 20
-        $json | Set-Content $script:MLDataFile -Force
+        $json | Set-Content $DataFile -Force
         return $true
     } catch {
         Write-Warning "Failed to save ML data: $_"
@@ -910,5 +920,7 @@ Export-ModuleMember -Function @(
     'Set-MLProfile',
     'Get-MLProfileNames',
     'Get-MLRankingBasis',
-    'Get-RankingScore'
+    'Get-RankingScore',
+    'Get-PairDiversityBonus',
+    'Calculate-ServerScore'
 )
