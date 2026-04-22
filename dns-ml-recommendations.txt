@@ -1,83 +1,83 @@
 ========================================
 DNS Machine Learning Recommendations
 ========================================
-Generated: 2026-04-20 14:44:11
-Total Training Runs: 19
-Last Update: 04/20/2026 14:44:11
+Generated: 2026-04-22 14:37:22
+Total Training Runs: 23
+Last Update: 04/22/2026 14:37:22
 
 ========================================
 TOP 10 INDIVIDUAL DNS SERVERS
 ========================================
-TE-Data Secondary (163.121.128.134)
-  Category: Egyptian
-  ML Score: 0.09 (lower is better)
-  Avg Response: 3.27 ms
-  Avg Success Rate: 100%
-  Tests: 6
-  Trend: ↑ Improving
 TE-Data Primary (163.121.128.135)
   Category: Egyptian
-  ML Score: 0.1 (lower is better)
-  Avg Response: 3.53 ms
+  ML Score: 0.08 (lower is better)
+  Avg Response: 3.42 ms
+  Avg Success Rate: 100%
+  Tests: 10
+  Trend: ↑ Improving
+TE-Data Secondary (163.121.128.134)
+  Category: Egyptian
+  ML Score: 0.11 (lower is better)
+  Avg Response: 3.58 ms
+  Avg Success Rate: 100%
+  Tests: 10
+  Trend: ↑ Improving
+NextDNS DoH (45.90.28.0)
+  Category: Encrypted
+  ML Score: 9.89 (lower is better)
+  Avg Response: 58.21 ms
   Avg Success Rate: 100%
   Tests: 6
   Trend: ↑ Improving
-Cloudflare DNS Secondary (1.0.0.1)
-  Category: Global
-  ML Score: 17.18 (lower is better)
-  Avg Response: 95.42 ms
+Google DoH (8.8.8.8)
+  Category: Encrypted
+  ML Score: 10 (lower is better)
+  Avg Response: 58.31 ms
   Avg Success Rate: 100%
-  Tests: 13
+  Tests: 6
   Trend: ↑ Improving
-OpenDNS Secondary (208.67.220.220)
-  Category: Global
-  ML Score: 17.44 (lower is better)
-  Avg Response: 96.89 ms
+AdGuard DoH (94.140.14.14)
+  Category: Encrypted
+  ML Score: 11.09 (lower is better)
+  Avg Response: 64.86 ms
   Avg Success Rate: 100%
-  Tests: 13
-  Trend: ↑ Improving
-OpenDNS (208.67.222.222)
-  Category: Global
-  ML Score: 17.66 (lower is better)
-  Avg Response: 98.13 ms
-  Avg Success Rate: 100%
-  Tests: 13
-  Trend: ↑ Improving
-Cloudflare DNS (1.1.1.1)
-  Category: Global
-  ML Score: 17.96 (lower is better)
-  Avg Response: 99.79 ms
-  Avg Success Rate: 100%
-  Tests: 13
-  Trend: ↑ Improving
-Google DNS Secondary (8.8.4.4)
-  Category: Global
-  ML Score: 18.26 (lower is better)
-  Avg Response: 101.44 ms
-  Avg Success Rate: 100%
-  Tests: 13
-  Trend: ↑ Improving
-Google DNS (8.8.8.8)
-  Category: Global
-  ML Score: 18.41 (lower is better)
-  Avg Response: 102.28 ms
-  Avg Success Rate: 100%
-  Tests: 13
+  Tests: 6
   Trend: ↑ Improving
 Cloudflare DoH (1.1.1.1)
   Category: Encrypted
-  ML Score: 19.88 (lower is better)
-  Avg Response: 74.83 ms
+  ML Score: 11.2 (lower is better)
+  Avg Response: 65.26 ms
+  Avg Success Rate: 100%
+  Tests: 7
+  Trend: ↑ Improving
+Cloudflare DNS Secondary (1.0.0.1)
+  Category: Global
+  ML Score: 15.65 (lower is better)
+  Avg Response: 86.96 ms
+  Avg Success Rate: 100%
+  Tests: 16
+  Trend: ↑ Improving
+Cloudflare DNS (1.1.1.1)
+  Category: Global
+  ML Score: 16.25 (lower is better)
+  Avg Response: 90.29 ms
+  Avg Success Rate: 100%
+  Tests: 16
+  Trend: ↑ Improving
+Cloudflare for Teams (1.1.1.2)
+  Category: Global
+  ML Score: 16.38 (lower is better)
+  Avg Response: 49.24 ms
   Avg Success Rate: 100%
   Tests: 4
   Trend: → Stable
-AdGuard DNS (94.140.14.14)
+OpenDNS Family Shield 2 (208.67.220.123)
   Category: Global
-  ML Score: 20.16 (lower is better)
-  Avg Response: 112.01 ms
+  ML Score: 16.43 (lower is better)
+  Avg Response: 49.55 ms
   Avg Success Rate: 100%
-  Tests: 13
-  Trend: ↑ Improving
+  Tests: 4
+  Trend: → Stable
 
 ========================================
 TOP 5 DNS PAIR CONFIGURATIONS
@@ -85,19 +85,19 @@ TOP 5 DNS PAIR CONFIGURATIONS
 Primary: TE-Data Secondary (163.121.128.134)
 Secondary: TE-Data Primary (163.121.128.135)
   Type: Best Overall
-  ML Score: 3.33
-  Tests: 3
+  ML Score: 3.17
+  Tests: 6
   Best Score: 3
-  Times Recommended: 9
-  Last Seen: 04/20/2026 14:44:11
+  Times Recommended: 13
+  Last Seen: 04/22/2026 14:37:22
 Primary: TE-Data Primary (163.121.128.135)
 Secondary: TE-Data Secondary (163.121.128.134)
   Type: Best Overall
-  ML Score: 3.5
-  Tests: 2
+  ML Score: 4.33
+  Tests: 3
   Best Score: 3
   Times Recommended: 4
-  Last Seen: 04/20/2026 14:22:20
+  Last Seen: 04/22/2026 14:33:41
 Primary: TE-Data Secondary (163.121.128.134)
 Secondary: Google DNS Secondary (8.8.4.4)
   Type: Best Overall

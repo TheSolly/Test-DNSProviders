@@ -150,11 +150,13 @@ if (-not (Get-Command "Resolve-DnsName" -ErrorAction SilentlyContinue)) {
 }
 
 # Apply quick test mode settings
-# Apply quick test mode settings
 if ($QuickTest) {
-    # Aggressive QuickTest optimizations for maximum speed
-    $TestCount = 1  # Single test per DNS (fastest)
-    $Timeout = 1    # 1 second timeout (aggressive but effective)
+    # Aggressive QuickTest optimizations for maximum speed.
+    # Honour explicit -TestCount / -Timeout overrides so users can opt back into
+    # multi-sample jitter measurement while keeping the rest of QuickTest's
+    # speedups (skip advanced tests, ML prioritisation, single-domain, etc).
+    if (-not $PSBoundParameters.ContainsKey('TestCount')) { $TestCount = 1 }
+    if (-not $PSBoundParameters.ContainsKey('Timeout'))   { $Timeout   = 1 }
     $AggressiveMode = $true
     $DisableFailureRemoval = $false
     
@@ -174,7 +176,7 @@ if ($QuickTest) {
     # Focus on previously successful DNS servers first
     $script:QuickTestMode = $true
     
-    Write-Verbose "QuickTest: Optimized for speed - 1 test per DNS, 1s timeout, skipping advanced tests"
+    Write-Verbose "QuickTest: TestCount=$TestCount, Timeout=${Timeout}s, advanced tests skipped"
 }
 
 # Global variables for failure tracking
